@@ -84,7 +84,7 @@ export async function AnthropicAuthPlugin({ client }) {
       async loader(getAuth, provider) {
         const auth = await getAuth();
         if (auth.type === "oauth") {
-          // zero out cost for max plan and cap context to 200k (1M beta not available for OAuth)
+          // zero out cost for max plan
           for (const model of Object.values(provider.models)) {
             model.cost = {
               input: 0,
@@ -94,7 +94,6 @@ export async function AnthropicAuthPlugin({ client }) {
                 write: 0,
               },
             };
-            model.limit.context = Math.min(model.limit.context, 200_000);
           }
           return {
             apiKey: "",
@@ -172,8 +171,7 @@ export async function AnthropicAuthPlugin({ client }) {
               const incomingBetasList = incomingBeta
                 .split(",")
                 .map((b) => b.trim())
-                .filter(Boolean)
-                .filter((b) => !b.startsWith("context-1m"));
+                .filter(Boolean);
 
               const requiredBetas = [
                 "oauth-2025-04-20",
