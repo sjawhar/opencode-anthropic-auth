@@ -22,7 +22,10 @@ function poolLog(msg) {
 const STALE_5H = 3600000; // 1 hour
 const STALE_7D = 43200000; // 12 hours
 const STALE_OVERAGE = 1800000; // 30 min
-const COOLDOWN_MS = 300000;
+const TRANSIENT_THRESHOLD = 10000;
+const CLOCK_SKEW_BUFFER = 2000;
+const FALLBACK_COOLDOWN = 30000;
+const MAX_RETRY_AFTER = 60;
 const THRESHOLD = 0.8;
 
 function loadPool() {
@@ -44,7 +47,7 @@ function loadPool() {
       cooloffUntil: r.cooldown_until || 0,
       overage: now - r.overage_at < STALE_OVERAGE ? !!r.overage : false,
     })),
-    config: { cooldownMs: COOLDOWN_MS, threshold: THRESHOLD },
+    config: { threshold: THRESHOLD },
   };
 }
 
@@ -103,19 +106,29 @@ function pickNext(pool, current) {
   const now = Date.now();
   const threshold = pool.config.threshold;
   const currentUtil = Math.max(current.util5h, current.util7d);
-  const available = pool.accounts.filter((a) => a !== current && now >= a.cooloffUntil);
+  const available = pool.accounts.filter(
+    (a) => a !== current && now >= a.cooloffUntil,
+  );
   if (!available.length) return current;
   // Prefer healthy accounts (under threshold, no overage)
-  const healthy = available.filter((a) => Math.max(a.util5h, a.util7d) < threshold && !a.overage);
+  const healthy = available.filter(
+    (a) => Math.max(a.util5h, a.util7d) < threshold && !a.overage,
+  );
   if (healthy.length) return healthy[0];
   // Prefer accounts with lower utilization than current
-  const better = available.filter((a) => Math.max(a.util5h, a.util7d) < currentUtil);
+  const better = available.filter(
+    (a) => Math.max(a.util5h, a.util7d) < currentUtil,
+  );
   if (better.length) {
-    better.sort((a, b) => Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d));
+    better.sort(
+      (a, b) => Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d),
+    );
     return better[0];
   }
   // All accounts are equally bad — pick the one with lowest util anyway
-  available.sort((a, b) => Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d));
+  available.sort(
+    (a, b) => Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d),
+  );
   return available[0];
 }
 
@@ -193,6 +206,31 @@ function parseUtil(response, account) {
   if (h5 != null) account.util5h = parseFloat(h5);
   if (h7 != null) account.util7d = parseFloat(h7);
   if (overage != null) account.overage = overage === "true";
+}
+
+function parseCooldown(response, now = Date.now()) {
+  const ms = parseInt(response.headers.get("retry-after-ms"));
+  if (ms > 0) return now + ms;
+
+  const val = parseFloat(response.headers.get("retry-after"));
+  if (val > 0) return now + val * 1000;
+
+  const reset = [
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-reset",
+    "anthropic-ratelimit-input-tokens-reset",
+    "anthropic-ratelimit-output-tokens-reset",
+  ].flatMap((header) => {
+    const val = response.headers.get(header);
+    if (val == null) return [];
+    const ts = new Date(val).getTime();
+    if (Number.isNaN(ts)) return [];
+    if (ts <= now) return [now + CLOCK_SKEW_BUFFER];
+    return [ts];
+  });
+  if (reset.length) return Math.min(...reset);
+
+  return now + FALLBACK_COOLDOWN;
 }
 
 // --- OAuth flow ---
@@ -415,7 +453,9 @@ export async function AnthropicAuthPlugin({ client }) {
             // Start with healthiest account, not arbitrary DB order
             pool.accounts.sort((a, b) => {
               if (a.overage !== b.overage) return a.overage ? 1 : -1;
-              return Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d);
+              return (
+                Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d)
+              );
             });
             let current = pool.accounts[0];
             poolLog(
@@ -478,7 +518,9 @@ export async function AnthropicAuthPlugin({ client }) {
                     current = pickNext(pool, current);
                     if (current === prev || tried401.has(current.id)) break;
                     tried401.add(current.id);
-                    poolLog(`401/403 trying "${current.label}" after "${prev.label}" failed`);
+                    poolLog(
+                      `401/403 trying "${current.label}" after "${prev.label}" failed`,
+                    );
                     const ok2 = await refreshToken(current);
                     if (!ok2) continue;
                     const retry = buildRequest(input, init, current.access);
@@ -489,26 +531,54 @@ export async function AnthropicAuthPlugin({ client }) {
                     });
                     parseUtil(r2, current);
                     saveUtil(current);
-                    if (r2.status !== 401 && r2.status !== 403) return wrapStream(r2);
+                    if (r2.status !== 401 && r2.status !== 403)
+                      return wrapStream(r2);
                     last401 = r2;
-                    setCooldown(current.id, Date.now() + pool.config.cooldownMs);
+                    setCooldown(
+                      current.id,
+                      Date.now() + pool.config.cooldownMs,
+                    );
                     current.cooloffUntil = Date.now() + pool.config.cooldownMs;
                   }
                   return wrapStream(last401);
                 }
 
-                // 429: switch + retry, try all accounts before giving up
+                // 429: brief retry on same account first (transient), then rotate
                 if (response.status === 429) {
+                  // Retry same account after short delay — most 429s are transient
+                  const retryAfter = parseInt(
+                    response.headers.get("retry-after") || "0",
+                  );
+                  const delay = Math.min(
+                    retryAfter > 0 ? retryAfter * 1000 : 2000,
+                    10000,
+                  );
+                  await new Promise((r) => setTimeout(r, delay));
+                  const sameRetry = buildRequest(input, init, current.access);
+                  const sameResp = await fetch(sameRetry.requestInput, {
+                    ...(init ?? {}),
+                    body: sameRetry.body,
+                    headers: sameRetry.requestHeaders,
+                  });
+                  if (sameResp.status !== 429) {
+                    parseUtil(sameResp, current);
+                    saveUtil(current);
+                    return wrapStream(sameResp);
+                  }
+
+                  // Still 429 — rotate through other accounts
                   setCooldown(current.id, Date.now() + pool.config.cooldownMs);
                   current.cooloffUntil = Date.now() + pool.config.cooldownMs;
                   const tried = new Set([current.id]);
-                  let last429 = response;
+                  let last429 = sameResp;
                   while (tried.size < pool.accounts.length) {
                     const prev = current;
                     current = pickNext(pool, current);
                     if (current === prev || tried.has(current.id)) break;
                     tried.add(current.id);
-                    poolLog(`429 trying "${current.label}" after "${prev.label}" rate limited`);
+                    poolLog(
+                      `429 trying "${current.label}" after "${prev.label}" rate limited`,
+                    );
                     if (!current.access || current.expires < Date.now()) {
                       const ok = await refreshToken(current);
                       if (!ok) continue;
@@ -523,7 +593,10 @@ export async function AnthropicAuthPlugin({ client }) {
                     saveUtil(current);
                     if (r2.status !== 429) return wrapStream(r2);
                     last429 = r2;
-                    setCooldown(current.id, Date.now() + pool.config.cooldownMs);
+                    setCooldown(
+                      current.id,
+                      Date.now() + pool.config.cooldownMs,
+                    );
                     current.cooloffUntil = Date.now() + pool.config.cooldownMs;
                   }
                   return wrapStream(last429);
@@ -541,7 +614,8 @@ export async function AnthropicAuthPlugin({ client }) {
                   if (
                     candidate !== current &&
                     !candidate.overage &&
-                    Math.max(candidate.util5h, candidate.util7d) < pool.config.threshold
+                    Math.max(candidate.util5h, candidate.util7d) <
+                      pool.config.threshold
                   ) {
                     poolLog(
                       `proactive switch from "${current.label}" to "${candidate.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`,
