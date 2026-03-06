@@ -412,9 +412,14 @@ export async function AnthropicAuthPlugin({ client }) {
 
           // Pool mode
           if (pool) {
+            // Start with healthiest account, not arbitrary DB order
+            pool.accounts.sort((a, b) => {
+              if (a.overage !== b.overage) return a.overage ? 1 : -1;
+              return Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d);
+            });
             let current = pool.accounts[0];
             poolLog(
-              `pool mode: ${pool.accounts.length} accounts, starting with "${current.label}"`,
+              `pool mode: ${pool.accounts.length} accounts, starting with "${current.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`,
             );
 
             return {
