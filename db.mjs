@@ -31,7 +31,35 @@ export function open() {
       cooldown_until INTEGER NOT NULL DEFAULT 0
     )
   `);
+  // Migrations: add columns for refresh lock and failure tracking
+  try { db.exec("ALTER TABLE account ADD COLUMN refresh_lock INTEGER NOT NULL DEFAULT 0"); } catch {}
+  try { db.exec("ALTER TABLE account ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"); } catch {}
   return db;
+}
+
+// Stale lock timeout: if a process crashes mid-refresh, the lock expires after this
+const LOCK_TIMEOUT = 30000; // 30s
+
+/**
+ * Atomically acquire an exclusive refresh lock for an account.
+ * Uses SQLite write serialization to guarantee only one process wins.
+ * Returns true if lock acquired, false if another process holds it.
+ */
+export function tryAcquireRefreshLock(id) {
+  const db = open();
+  const now = Date.now();
+  const result = db.prepare(
+    "UPDATE account SET refresh_lock = ? WHERE id = ? AND (refresh_lock = 0 OR refresh_lock < ?)"
+  ).run(now, id, now - LOCK_TIMEOUT);
+  return result.changes === 1;
+}
+
+/**
+ * Release the refresh lock for an account.
+ */
+export function releaseRefreshLock(id) {
+  const db = open();
+  db.prepare("UPDATE account SET refresh_lock = 0 WHERE id = ?").run(id);
 }
 
 export function config(key, fallback) {

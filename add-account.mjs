@@ -74,4 +74,4 @@ async function main() {
   console.log(`\nAccount "${label}" added. Pool now has ${count} account(s).`);
 }
 
-main();
+await main();

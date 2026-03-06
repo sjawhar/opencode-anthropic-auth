@@ -2,7 +2,7 @@ import { generatePKCE } from "@openauthjs/openauth/pkce";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { open } from "./db.mjs";
+import { open, tryAcquireRefreshLock, releaseRefreshLock } from "./db.mjs";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
@@ -80,12 +80,6 @@ function saveRefresh(account) {
   ).run(account.refresh, account.access, account.expires, account.id);
 }
 
-function readRefresh(id) {
-  const db = open();
-  const row = db.prepare("SELECT refresh FROM account WHERE id = ?").get(id);
-  return row?.refresh ?? null;
-}
-
 function markDead(id, reason) {
   const db = open();
   db.prepare("UPDATE account SET status = 'dead' WHERE id = ?").run(id);
@@ -132,35 +126,74 @@ function pickNext(pool, current) {
   return available[0];
 }
 
-// --- Token refresh (reads latest from DB, optimistic recovery on failure) ---
+// --- Token refresh (serialized via SQLite lock to prevent rotation races) ---
+
+const LOCK_WAIT_MS = 2000;
+const LOCK_MAX_RETRIES = 3;
+const DEAD_AFTER_FAILURES = 3;
 
 async function refreshToken(account) {
-  // Read latest token from DB (another process may have rotated it)
-  const disk = readRefresh(account.id);
-  if (disk && disk !== account.refresh) {
+  const db = open();
+
+  // Step 1: Check if token is already valid (another process may have refreshed)
+  const cached = db
+    .prepare("SELECT refresh, access, expires FROM account WHERE id = ?")
+    .get(account.id);
+  if (cached && cached.access && cached.expires > Date.now() + 5000) {
+    account.refresh = cached.refresh;
+    account.access = cached.access;
+    account.expires = cached.expires;
+    return true;
+  }
+  // Sync refresh token from DB (another process may have rotated it)
+  if (cached && cached.refresh !== account.refresh) {
     poolLog(`re-read fresher token for "${account.label}" from db`);
-    account.refresh = disk;
+    account.refresh = cached.refresh;
   }
 
-  const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: account.refresh,
-      client_id: CLIENT_ID,
-    }),
-  });
+  // Step 2: Acquire exclusive refresh lock (SQLite write-serialized CAS)
+  let lockAcquired = false;
+  for (let attempt = 0; attempt < LOCK_MAX_RETRIES; attempt++) {
+    if (tryAcquireRefreshLock(account.id)) {
+      lockAcquired = true;
+      break;
+    }
+    // Another process is refreshing — wait for it to finish
+    poolLog(
+      `refresh lock held for "${account.label}", waiting (attempt ${attempt + 1}/${LOCK_MAX_RETRIES})`,
+    );
+    await new Promise((r) => setTimeout(r, LOCK_WAIT_MS));
 
-  if (!response.ok) {
-    // Optimistic recovery: re-read DB, if token changed another process refreshed
-    const retry = readRefresh(account.id);
-    if (retry && retry !== account.refresh) {
-      poolLog(
-        `optimistic recovery for "${account.label}": token changed in db`,
-      );
-      account.refresh = retry;
-      const r2 = await fetch("https://console.anthropic.com/v1/oauth/token", {
+    // Check if the other process succeeded while we waited
+    const updated = db
+      .prepare("SELECT refresh, access, expires FROM account WHERE id = ?")
+      .get(account.id);
+    if (updated && updated.access && updated.expires > Date.now() + 5000) {
+      account.refresh = updated.refresh;
+      account.access = updated.access;
+      account.expires = updated.expires;
+      poolLog(`got refreshed token from another process for "${account.label}"`);
+      return true;
+    }
+  }
+
+  if (!lockAcquired) {
+    poolLog(
+      `could not acquire refresh lock for "${account.label}" after ${LOCK_MAX_RETRIES} attempts`,
+    );
+    return false;
+  }
+
+  // Step 3: We hold the lock — re-read token and do the actual refresh
+  try {
+    const fresh = db
+      .prepare("SELECT refresh FROM account WHERE id = ?")
+      .get(account.id);
+    if (fresh && fresh.refresh !== account.refresh) {
+      account.refresh = fresh.refresh;
+    }
+
+  const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -168,31 +201,47 @@ async function refreshToken(account) {
           refresh_token: account.refresh,
           client_id: CLIENT_ID,
         }),
-      });
-      if (r2.ok) {
-        const json = await r2.json();
-        account.refresh = json.refresh_token;
-        account.access = json.access_token;
-        account.expires = Date.now() + json.expires_in * 1000;
-        saveRefresh(account);
-        return true;
-      }
-    }
-    // Truly dead if disk token matches what we tried
-    const current = readRefresh(account.id);
-    if (current === account.refresh) {
-      markDead(account.id, "invalid_grant after optimistic retry");
-    }
-    poolLog(`refresh failed for "${account.label}"`);
-    return false;
-  }
+      },
+    );
 
-  const json = await response.json();
-  account.refresh = json.refresh_token;
-  account.access = json.access_token;
-  account.expires = Date.now() + json.expires_in * 1000;
-  saveRefresh(account);
-  return true;
+    if (response.ok) {
+      const json = await response.json();
+      account.refresh = json.refresh_token;
+      account.access = json.access_token;
+      account.expires = Date.now() + json.expires_in * 1000;
+      saveRefresh(account);
+      // Reset failure counter on success
+      db.prepare(
+        "UPDATE account SET consecutive_failures = 0 WHERE id = ?",
+      ).run(account.id);
+      releaseRefreshLock(account.id);
+      return true;
+    }
+
+    // Refresh failed — increment failure counter
+    poolLog(`refresh failed (HTTP ${response.status}) for "${account.label}"`);
+    db.prepare(
+      "UPDATE account SET consecutive_failures = consecutive_failures + 1 WHERE id = ?",
+    ).run(account.id);
+    const row = db
+      .prepare("SELECT consecutive_failures FROM account WHERE id = ?")
+      .get(account.id);
+    const failures = row?.consecutive_failures ?? 0;
+
+    if (failures >= DEAD_AFTER_FAILURES) {
+      markDead(account.id, `${failures} consecutive refresh failures`);
+    } else {
+      poolLog(
+        `refresh failure ${failures}/${DEAD_AFTER_FAILURES} for "${account.label}" (not marking dead yet)`,
+      );
+    }
+
+    releaseRefreshLock(account.id);
+    return false;
+  } catch (e) {
+    releaseRefreshLock(account.id);
+    throw e;
+  }
 }
 
 // --- Utilization header parsing ---
@@ -470,11 +519,8 @@ export async function AnthropicAuthPlugin({ client }) {
                   const ok = await refreshToken(current);
                   if (!ok) {
                     const prev = current;
-                    setCooldown(
-                      current.id,
-                      Date.now() + pool.config.cooldownMs,
-                    );
-                    current.cooloffUntil = Date.now() + pool.config.cooldownMs;
+                    setCooldown(current.id, Date.now() + FALLBACK_COOLDOWN);
+                    current.cooloffUntil = Date.now() + FALLBACK_COOLDOWN;
                     current = pickNext(pool, current);
                     poolLog(
                       `refresh failed, switching from "${prev.label}" to "${current.label}"`,
@@ -509,8 +555,9 @@ export async function AnthropicAuthPlugin({ client }) {
                     return wrapStream(r2);
                   }
                   // Refresh failed — try every other account before giving up
-                  setCooldown(current.id, Date.now() + pool.config.cooldownMs);
-                  current.cooloffUntil = Date.now() + pool.config.cooldownMs;
+                  const until = parseCooldown(response);
+                  setCooldown(current.id, until);
+                  current.cooloffUntil = until;
                   const tried401 = new Set([current.id]);
                   let last401 = response;
                   while (tried401.size < pool.accounts.length) {
@@ -534,11 +581,9 @@ export async function AnthropicAuthPlugin({ client }) {
                     if (r2.status !== 401 && r2.status !== 403)
                       return wrapStream(r2);
                     last401 = r2;
-                    setCooldown(
-                      current.id,
-                      Date.now() + pool.config.cooldownMs,
-                    );
-                    current.cooloffUntil = Date.now() + pool.config.cooldownMs;
+                    const until = parseCooldown(r2);
+                    setCooldown(current.id, until);
+                    current.cooloffUntil = until;
                   }
                   return wrapStream(last401);
                 }
