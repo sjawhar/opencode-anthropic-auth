@@ -405,7 +405,7 @@ export async function AnthropicAuthPlugin({ client }) {
         const auth = await getAuth();
         const pool = loadPool();
 
-        if (auth.type === "oauth" || pool) {
+        if ((auth && auth.type === "oauth") || pool) {
           for (const model of Object.values(provider.models)) {
             model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } };
           }
