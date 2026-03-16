@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { generatePKCE } from "@openauthjs/openauth/pkce";
 import { createInterface } from "node:readline";
+import { persistAccountCredentials } from "./add-account-lib.mjs";
 import { open } from "./db.mjs";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -40,7 +41,7 @@ async function main() {
   const code = await prompt("\nPaste the authorization code here: ");
 
   const splits = code.split("#");
-  const result = await fetch("https://console.anthropic.com/v1/oauth/token", {
+  const result = await fetch("https://api.anthropic.com/v1/oauth/token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -59,16 +60,13 @@ async function main() {
   }
 
   const json = await result.json();
-  const id = json.account?.uuid;
-  if (!id) {
-    console.error("Authorization succeeded but account UUID is missing.");
+  const db = open();
+  try {
+    persistAccountCredentials(db, label, json);
+  } catch (error) {
+    console.error(error.message);
     process.exit(1);
   }
-
-  const db = open();
-  db.prepare(
-    "INSERT OR REPLACE INTO account (id, label, refresh) VALUES (?, ?, ?)",
-  ).run(id, label.trim() || "unnamed", json.refresh_token);
 
   const count = db.prepare("SELECT COUNT(*) as n FROM account").get().n;
   console.log(`\nAccount "${label}" added. Pool now has ${count} account(s).`);

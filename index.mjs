@@ -1,10 +1,15 @@
 import { generatePKCE } from "@openauthjs/openauth/pkce";
+import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { open, tryAcquireRefreshLock, releaseRefreshLock } from "./db.mjs";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_CODE_VERSION = "2.1.76";
+const CLAUDE_CODE_AGENT = `claude-code/${CLAUDE_CODE_VERSION}`;
+const BILLING_SALT = "59cf53e54c78";
+const BILLING_ENTRY_ENV = "CLAUDE_CODE_ENTRYPOINT";
 
 // --- Logging ---
 
@@ -14,6 +19,14 @@ function poolLog(msg) {
   try {
     writeFileSync(LOG_PATH, `${ts} ${msg}\n`, { flag: "a" });
   } catch {}
+}
+
+function authHeaders(extra = {}) {
+  return {
+    "Content-Type": "application/json",
+    "User-Agent": CLAUDE_CODE_AGENT,
+    ...extra,
+  };
 }
 
 // --- SQLite pool helpers ---
@@ -193,16 +206,15 @@ async function refreshToken(account) {
       account.refresh = fresh.refresh;
     }
 
-  const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          grant_type: "refresh_token",
-          refresh_token: account.refresh,
-          client_id: CLIENT_ID,
-        }),
-      },
-    );
+    const response = await fetch("https://api.anthropic.com/v1/oauth/token", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: account.refresh,
+        client_id: CLIENT_ID,
+      }),
+    });
 
     if (response.ok) {
       const json = await response.json();
@@ -219,7 +231,10 @@ async function refreshToken(account) {
     }
 
     // Refresh failed — increment failure counter
-    poolLog(`refresh failed (HTTP ${response.status}) for "${account.label}"`);
+    const failureBody = await response.text();
+    poolLog(
+      `refresh failed (${describeRefreshFailure(response.status, failureBody)}) for "${account.label}"`,
+    );
     db.prepare(
       "UPDATE account SET consecutive_failures = consecutive_failures + 1 WHERE id = ?",
     ).run(account.id);
@@ -282,6 +297,58 @@ function parseCooldown(response, now = Date.now()) {
   return now + FALLBACK_COOLDOWN;
 }
 
+function firstUserText(messages) {
+  if (!Array.isArray(messages)) return "";
+
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    if (message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    if (!Array.isArray(message.content)) return "";
+
+    for (const block of message.content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type !== "text") continue;
+      if (typeof block.text === "string") return block.text;
+    }
+
+    return "";
+  }
+
+  return "";
+}
+
+function buildBillingHeader(body) {
+  const json = JSON.parse(body);
+  const sample = [4, 7, 20]
+    .map((idx) => firstUserText(json.messages).charAt(idx) || "0")
+    .join("");
+  const hash = createHash("sha256")
+    .update(`${BILLING_SALT}${sample}${CLAUDE_CODE_VERSION}`)
+    .digest("hex")
+    .slice(0, 3);
+  const entrypoint = process.env[BILLING_ENTRY_ENV]?.trim() || "cli";
+
+  return `cc_version=${CLAUDE_CODE_VERSION}.${hash}; cc_entrypoint=${entrypoint}; cch=00000;`;
+}
+
+function describeRefreshFailure(status, bodyText) {
+  if (!bodyText) return `HTTP ${status}`;
+
+  try {
+    const parsed = JSON.parse(bodyText);
+    const error = parsed?.error;
+    if (error?.type && error?.message) {
+      return `HTTP ${status} ${error.type}: ${error.message}`;
+    }
+  } catch {}
+
+  const compact = bodyText.replace(/\s+/g, " ").trim();
+  if (!compact) return `HTTP ${status}`;
+  const preview = compact.length > 200 ? `${compact.slice(0, 197)}...` : compact;
+  return `HTTP ${status} ${preview}`;
+}
+
 // --- OAuth flow ---
 
 async function authorize(mode) {
@@ -309,9 +376,9 @@ async function authorize(mode) {
 
 async function exchange(code, verifier) {
   const splits = code.split("#");
-  const result = await fetch("https://console.anthropic.com/v1/oauth/token", {
+  const result = await fetch("https://api.anthropic.com/v1/oauth/token", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders(),
     body: JSON.stringify({
       code: splits[0],
       state: splits[1],
@@ -368,14 +435,14 @@ function buildRequest(input, init, access) {
     .split(",")
     .map((b) => b.trim())
     .filter(Boolean);
-  const requiredBetas = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
+  const requiredBetas = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14", "context-1m-2025-08-07"];
   const mergedBetas = [
     ...new Set([...requiredBetas, ...incomingBetasList]),
   ].join(",");
 
   requestHeaders.set("authorization", `Bearer ${access}`);
   requestHeaders.set("anthropic-beta", mergedBetas);
-  requestHeaders.set("user-agent", "claude-cli/2.1.2 (external, cli)");
+  requestHeaders.set("user-agent", CLAUDE_CODE_AGENT);
   requestHeaders.delete("x-api-key");
 
   let body = requestInit.body;
@@ -428,6 +495,14 @@ function buildRequest(input, init, access) {
     }
   } catch {
     requestUrl = null;
+  }
+
+  if (
+    requestUrl &&
+    requestUrl.pathname === "/v1/messages" &&
+    typeof body === "string"
+  ) {
+    requestHeaders.set("x-anthropic-billing-header", buildBillingHeader(body));
   }
 
   if (
@@ -704,10 +779,10 @@ export async function AnthropicAuthPlugin({ client }) {
               if (auth.type !== "oauth") return fetch(input, init);
               if (!auth.access || auth.expires < Date.now()) {
                 const response = await fetch(
-                  "https://console.anthropic.com/v1/oauth/token",
+                  "https://api.anthropic.com/v1/oauth/token",
                   {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: authHeaders(),
                     body: JSON.stringify({
                       grant_type: "refresh_token",
                       refresh_token: auth.refresh,
@@ -739,10 +814,10 @@ export async function AnthropicAuthPlugin({ client }) {
                 const cur = await getAuth();
                 if (cur.type !== "oauth") return wrapStream(response);
                 const token = await fetch(
-                  "https://console.anthropic.com/v1/oauth/token",
+                  "https://api.anthropic.com/v1/oauth/token",
                   {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: authHeaders(),
                     body: JSON.stringify({
                       grant_type: "refresh_token",
                       refresh_token: cur.refresh,
@@ -806,10 +881,9 @@ export async function AnthropicAuthPlugin({ client }) {
                   `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
                   {
                     method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
+                    headers: authHeaders({
                       authorization: `Bearer ${credentials.access}`,
-                    },
+                    }),
                   },
                 ).then((r) => r.json());
                 return { type: "success", key: result.raw_key };
@@ -826,3 +900,5 @@ export async function AnthropicAuthPlugin({ client }) {
     },
   };
 }
+
+export const __test = { authHeaders, buildBillingHeader, buildRequest, describeRefreshFailure };
