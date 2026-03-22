@@ -1,0 +1,15 @@
+{
+  "name": "openclaw-anthropic-oauth",
+  "version": "0.1.0",
+  "main": "./index.mjs",
+  "openclaw": {
+    "extensions": ["dist/index.mjs"]
+  },
+  "scripts": {
+    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs"
+  },
+  "files": ["dist"],
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

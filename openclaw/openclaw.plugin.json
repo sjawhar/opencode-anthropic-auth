@@ -1,0 +1,9 @@
+{
+  "id": "openclaw-anthropic-oauth",
+  "providers": ["anthropic-oauth"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
