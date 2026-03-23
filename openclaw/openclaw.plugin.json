@@ -1,6 +1,18 @@
 {
   "id": "openclaw-anthropic-oauth",
-  "providers": ["anthropic-oauth"],
+  "providers": ["anthropic"],
+  "providerAuthChoices": [
+    {
+      "provider": "anthropic",
+      "method": "claude-oauth",
+      "choiceId": "anthropic-claude-oauth",
+      "choiceLabel": "Anthropic Claude OAuth",
+      "choiceHint": "Browser OAuth for Claude Pro/Max",
+      "groupId": "anthropic",
+      "groupLabel": "Anthropic",
+      "groupHint": "Browser OAuth"
+    }
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
