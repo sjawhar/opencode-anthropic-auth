@@ -2,9 +2,9 @@ import { createHash, randomBytes } from "node:crypto";
 
 export const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 export const CLAUDE_CODE_VERSION = "2.1.76";
-export const CLAUDE_CODE_AGENT = `claude-code/${CLAUDE_CODE_VERSION}`;
+export const CLAUDE_CODE_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;
 
-export const TOKEN_URL = "https://api.anthropic.com/v1/oauth/token";
+export const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 export const AUTHORIZE_URL_BASE = {
   console: "https://console.anthropic.com/oauth/authorize",
   max: "https://claude.ai/oauth/authorize",
@@ -28,10 +28,19 @@ function generatePkce() {
 
 export function authHeaders(extra = {}) {
   return {
-    "Content-Type": "application/json",
     "User-Agent": CLAUDE_CODE_AGENT,
     ...extra,
   };
+}
+
+function formBody(params) {
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) {
+      body.set(key, String(value));
+    }
+  }
+  return body;
 }
 
 export async function authorize(mode = "max") {
@@ -54,17 +63,20 @@ export async function authorize(mode = "max") {
 
 export async function exchange(code, verifier) {
   const splits = String(code ?? "").split("#");
+  const body = formBody({
+    code: splits[0],
+    state: splits[1],
+    grant_type: "authorization_code",
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    code_verifier: verifier,
+  });
   const result = await fetch(TOKEN_URL, {
     method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      code: splits[0],
-      state: splits[1],
-      grant_type: "authorization_code",
-      client_id: CLIENT_ID,
-      redirect_uri: REDIRECT_URI,
-      code_verifier: verifier,
+    headers: authHeaders({
+      "Content-Type": "application/x-www-form-urlencoded",
     }),
+    body,
   });
 
   if (!result.ok) return { type: "failed" };
@@ -78,14 +90,17 @@ export async function exchange(code, verifier) {
 }
 
 export async function refreshAccessToken(refreshToken) {
+  const body = formBody({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: CLIENT_ID,
+  });
   const response = await fetch(TOKEN_URL, {
     method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
+    headers: authHeaders({
+      "Content-Type": "application/x-www-form-urlencoded",
     }),
+    body,
   });
 
   if (!response.ok) {
