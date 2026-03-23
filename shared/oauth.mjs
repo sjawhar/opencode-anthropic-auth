@@ -117,3 +117,28 @@ export async function refreshAccessToken(refreshToken) {
     expires: Date.now() + json.expires_in * 1000,
   };
 }
+
+export async function createApiKeyFromAccessToken(accessToken) {
+  const response = await fetch("https://api.anthropic.com/api/oauth/claude_cli/create_api_key", {
+    method: "POST",
+    headers: authHeaders({
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    }),
+    body: "{}",
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      `API key creation failed: ${response.status}${body ? ` ${body}` : ""}`,
+    );
+  }
+
+  const json = await response.json();
+  const key = typeof json?.raw_key === "string" ? json.raw_key.trim() : "";
+  if (!key) {
+    throw new Error("API key creation failed: missing raw_key");
+  }
+  return key;
+}
