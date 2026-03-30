@@ -17,6 +17,23 @@ function prompt(q) {
 }
 
 async function main() {
+  const isApiKey = process.argv.includes("--api-key");
+
+  if (isApiKey) {
+    const label = await prompt("Account label (e.g. fallback): ");
+    const key = await prompt("API key (sk-ant-...): ");
+    const db = open();
+    try {
+      persistAccountCredentials(db, label, { apiKey: key }, Date.now(), "apikey");
+    } catch (error) {
+      console.error(error.message);
+      process.exit(1);
+    }
+    const count = db.prepare("SELECT COUNT(*) as n FROM account").get().n;
+    console.log(`\nAPI key "${label}" added. Pool now has ${count} account(s).`);
+    return;
+  }
+
   const label = await prompt("Account label (e.g. personal, work): ");
   const pkce = await generatePKCE();
 

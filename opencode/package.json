@@ -3,7 +3,8 @@
   "version": "0.0.14",
   "main": "./index.mjs",
   "scripts": {
-    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:better-sqlite3 --external:bun:sqlite"
+    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:better-sqlite3 --external:bun:sqlite",
+    "test": "bun test"
   },
   "files": ["dist"],
   "devDependencies": {

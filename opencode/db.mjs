@@ -34,6 +34,7 @@ export function open() {
   // Migrations: add columns for refresh lock and failure tracking
   try { db.exec("ALTER TABLE account ADD COLUMN refresh_lock INTEGER NOT NULL DEFAULT 0"); } catch {}
   try { db.exec("ALTER TABLE account ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"); } catch {}
+  try { db.exec("ALTER TABLE account ADD COLUMN type TEXT NOT NULL DEFAULT 'oauth'"); } catch {}
   return db;
 }
 
@@ -62,6 +63,6 @@ export function releaseRefreshLock(id) {
   db.prepare("UPDATE account SET refresh_lock = 0 WHERE id = ?").run(id);
 }
 
-export function config(key, fallback) {
+export function config(_key, fallback) {
   return fallback;
 }
