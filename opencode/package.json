@@ -4,7 +4,7 @@
   "main": "./index.mjs",
   "scripts": {
     "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:better-sqlite3 --external:bun:sqlite",
-    "test": "bun test"
+    "test": "bun test index.test.mjs add-account.test.mjs && bun test pure.test.mjs e2e-smoke.test.mjs e2e-auth.test.mjs e2e-ratelimit.test.mjs e2e-state.test.mjs"
   },
   "files": ["dist"],
   "devDependencies": {

@@ -1,4 +1,4 @@
-import { mock, test, expect, beforeEach, afterEach } from "bun:test";
+import { mock, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
 
 const T = { db: null, refreshFn: null, fetchCalls: [] };
 const originalFetch = globalThis.fetch;
@@ -56,6 +56,8 @@ afterEach(() => {
   T.refreshFn = null;
   globalThis.fetch = originalFetch;
 });
+
+afterAll(() => { mock.restore(); });
 
 test("smoke: OAuth account, valid token, 200 response", async () => {
   const now = Date.now();
