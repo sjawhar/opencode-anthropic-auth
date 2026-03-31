@@ -1,5 +1,5 @@
 // index.mjs
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash2, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join as join2 } from "node:path";
 import { homedir as homedir2 } from "node:os";
@@ -43,6 +43,10 @@ function open() {
     db.exec("ALTER TABLE account ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0");
   } catch {
   }
+  try {
+    db.exec("ALTER TABLE account ADD COLUMN type TEXT NOT NULL DEFAULT 'oauth'");
+  } catch {
+  }
   return db;
 }
 var LOCK_TIMEOUT = 3e4;
@@ -58,13 +62,26 @@ function releaseRefreshLock(id) {
   const db2 = open();
   db2.prepare("UPDATE account SET refresh_lock = 0 WHERE id = ?").run(id);
 }
+function config(key, fallback) {
+  const db2 = open();
+  try {
+    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  } catch {
+  }
+  const row = db2.prepare("SELECT value FROM config WHERE key = ?").get(key);
+  if (!row) return fallback;
+  if (row.value === "true") return true;
+  if (row.value === "false") return false;
+  const num = Number(row.value);
+  return Number.isNaN(num) ? row.value : num;
+}
 
 // ../shared/oauth.mjs
 import { createHash, randomBytes } from "node:crypto";
 var CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 var CLAUDE_CODE_VERSION = "2.1.76";
-var CLAUDE_CODE_AGENT = `claude-code/${CLAUDE_CODE_VERSION}`;
-var TOKEN_URL = "https://api.anthropic.com/v1/oauth/token";
+var CLAUDE_CODE_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;
+var TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 var AUTHORIZE_URL_BASE = {
   console: "https://console.anthropic.com/oauth/authorize",
   max: "https://claude.ai/oauth/authorize"
@@ -81,10 +98,18 @@ function generatePkce() {
 }
 function authHeaders(extra = {}) {
   return {
-    "Content-Type": "application/json",
     "User-Agent": CLAUDE_CODE_AGENT,
     ...extra
   };
+}
+function formBody(params) {
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== void 0 && value !== null) {
+      body.set(key, String(value));
+    }
+  }
+  return body;
 }
 async function authorize(mode = "max") {
   const pkce = generatePkce();
@@ -102,17 +127,20 @@ async function authorize(mode = "max") {
 }
 async function exchange(code, verifier) {
   const splits = String(code ?? "").split("#");
+  const body = formBody({
+    code: splits[0],
+    state: splits[1],
+    grant_type: "authorization_code",
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    code_verifier: verifier
+  });
   const result = await fetch(TOKEN_URL, {
     method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      code: splits[0],
-      state: splits[1],
-      grant_type: "authorization_code",
-      client_id: CLIENT_ID,
-      redirect_uri: REDIRECT_URI,
-      code_verifier: verifier
-    })
+    headers: authHeaders({
+      "Content-Type": "application/x-www-form-urlencoded"
+    }),
+    body
   });
   if (!result.ok) return { type: "failed" };
   const json = await result.json();
@@ -124,19 +152,22 @@ async function exchange(code, verifier) {
   };
 }
 async function refreshAccessToken(refreshToken2) {
+  const body = formBody({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken2,
+    client_id: CLIENT_ID
+  });
   const response = await fetch(TOKEN_URL, {
     method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken2,
-      client_id: CLIENT_ID
-    })
+    headers: authHeaders({
+      "Content-Type": "application/x-www-form-urlencoded"
+    }),
+    body
   });
   if (!response.ok) {
-    const body = await response.text();
+    const body2 = await response.text();
     throw new Error(
-      `Token refresh failed: ${response.status}${body ? ` ${body}` : ""}`
+      `Token refresh failed: ${response.status}${body2 ? ` ${body2}` : ""}`
     );
   }
   const json = await response.json();
@@ -166,7 +197,7 @@ var TRANSIENT_THRESHOLD = 1e4;
 var CLOCK_SKEW_BUFFER = 2e3;
 var FALLBACK_COOLDOWN = 3e4;
 var MAX_RETRY_AFTER = 60;
-var THRESHOLD = 0.8;
+var MAX_COOLDOWN_FROM_RESET = 3e5;
 function loadPool() {
   const db2 = open();
   const rows = db2.prepare("SELECT * FROM account WHERE status = 'active'").all();
@@ -182,9 +213,11 @@ function loadPool() {
       util5h: now - r.util5h_at < STALE_5H ? r.util5h : 0,
       util7d: now - r.util7d_at < STALE_7D ? r.util7d : 0,
       cooloffUntil: r.cooldown_until || 0,
-      overage: now - r.overage_at < STALE_OVERAGE ? !!r.overage : false
-    })),
-    config: { threshold: THRESHOLD }
+      overage: now - r.overage_at < STALE_OVERAGE ? !!r.overage : false,
+      overageAt: r.overage_at || 0,
+      status: r.status || "active",
+      type: r.type || "oauth"
+    }))
   };
 }
 function saveUtil(account) {
@@ -228,29 +261,46 @@ function setCooldown(id, until) {
 }
 function pickNext(pool, current) {
   const now = Date.now();
-  const threshold = pool.config.threshold;
   const currentUtil = Math.max(current.util5h, current.util7d);
   const available = pool.accounts.filter(
     (a) => a !== current && now >= a.cooloffUntil
   );
-  if (!available.length) return current;
-  const healthy = available.filter(
-    (a) => Math.max(a.util5h, a.util7d) < threshold && !a.overage
-  );
-  if (healthy.length) return healthy[0];
-  const better = available.filter(
-    (a) => Math.max(a.util5h, a.util7d) < currentUtil
-  );
-  if (better.length) {
-    better.sort(
+  if (!available.length) {
+    const allStates = pool.accounts.map((a) => `"${a.label}"(cd=${a.cooloffUntil > now ? Math.round((a.cooloffUntil - now) / 1e3) + "s" : "none"})`).join(", ");
+    poolLog(`pickNext: no available accounts besides "${current.label}", keeping current. States: ${allStates}`);
+    return current;
+  }
+  const preferApikeyOverOverage = config("prefer_apikey_over_overage", false);
+  const oauthAvailable = available.filter((a) => (a.type || "oauth") !== "apikey");
+  const healthyOAuth = preferApikeyOverOverage ? oauthAvailable.filter((a) => !a.overage) : oauthAvailable;
+  const apikeyAvailable = available.filter((a) => (a.type || "oauth") === "apikey");
+  const candidates = healthyOAuth.length > 0 ? healthyOAuth : apikeyAvailable.length > 0 ? apikeyAvailable : oauthAvailable;
+  if (!candidates.length) return current;
+  const notInOverage = candidates.filter((a) => !a.overage);
+  if (notInOverage.length) {
+    notInOverage.sort(
       (a, b) => Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d)
     );
-    return better[0];
+    poolLog(`pickNext: found non-overage "${notInOverage[0].label}" (5h=${notInOverage[0].util5h.toFixed(2)} 7d=${notInOverage[0].util7d.toFixed(2)})`);
+    return notInOverage[0];
   }
-  available.sort(
+  if (current.overage && (current.type || "oauth") !== "apikey") {
+    poolLog(`pickNext: all in overage, staying on current "${current.label}"`);
+    return current;
+  }
+  candidates.sort(
     (a, b) => Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d)
   );
-  return available[0];
+  poolLog(`pickNext: all in overage, picked lowest-util "${candidates[0].label}" (5h=${candidates[0].util5h.toFixed(2)} 7d=${candidates[0].util7d.toFixed(2)})`);
+  return candidates[0];
+}
+function isAllOAuthExhausted(pool) {
+  const now = Date.now();
+  const oauthAccounts = pool.accounts.filter((a) => (a.type || "oauth") !== "apikey");
+  if (!oauthAccounts.length) return true;
+  return oauthAccounts.every(
+    (a) => a.cooloffUntil > now || a.overage === true || a.status === "dead"
+  );
 }
 var LOCK_WAIT_MS = 2e3;
 var LOCK_MAX_RETRIES = 3;
@@ -262,6 +312,7 @@ async function refreshToken(account) {
     account.refresh = cached.refresh;
     account.access = cached.access;
     account.expires = cached.expires;
+    poolLog(`refreshToken "${account.label}": already valid (expires ${new Date(cached.expires).toISOString()})`);
     return true;
   }
   if (cached && cached.refresh !== account.refresh) {
@@ -307,6 +358,7 @@ async function refreshToken(account) {
       db2.prepare(
         "UPDATE account SET consecutive_failures = 0 WHERE id = ?"
       ).run(account.id);
+      poolLog(`refreshToken "${account.label}": success, expires ${new Date(tokens.expires).toISOString()}`);
       releaseRefreshLock(account.id);
       return true;
     } catch (error) {
@@ -337,15 +389,34 @@ function parseUtil(response, account) {
   const overage = response.headers.get(
     "anthropic-ratelimit-unified-overage-in-use"
   );
+  const prev5h = account.util5h, prev7d = account.util7d, prevOvg = account.overage;
   if (h5 != null) account.util5h = parseFloat(h5);
   if (h7 != null) account.util7d = parseFloat(h7);
   if (overage != null) account.overage = overage === "true";
+  if (h5 != null || h7 != null || overage != null) {
+    poolLog(`util "${account.label}": 5h=${prev5h.toFixed(2)}->${account.util5h.toFixed(2)} 7d=${prev7d.toFixed(2)}->${account.util7d.toFixed(2)} overage=${prevOvg}->${account.overage}`);
+  }
 }
 function parseCooldown(response, now = Date.now()) {
+  const rlHeaders = {};
+  for (const [key, val2] of response.headers.entries()) {
+    if (key.startsWith("anthropic-ratelimit") || key === "retry-after" || key === "retry-after-ms") {
+      rlHeaders[key] = val2;
+    }
+  }
+  poolLog(`parseCooldown headers: ${JSON.stringify(rlHeaders)}`);
   const ms = parseInt(response.headers.get("retry-after-ms"));
-  if (ms > 0) return now + ms;
+  if (ms > 0) {
+    const until = now + ms;
+    poolLog(`parseCooldown: using retry-after-ms=${ms} -> cooldown until ${new Date(until).toISOString()} (${Math.round(ms / 1e3)}s)`);
+    return until;
+  }
   const val = parseFloat(response.headers.get("retry-after"));
-  if (val > 0) return now + val * 1e3;
+  if (val > 0) {
+    const until = now + val * 1e3;
+    poolLog(`parseCooldown: using retry-after=${val}s -> cooldown until ${new Date(until).toISOString()} (${val}s)`);
+    return until;
+  }
   const reset = [
     "anthropic-ratelimit-requests-reset",
     "anthropic-ratelimit-tokens-reset",
@@ -355,11 +426,23 @@ function parseCooldown(response, now = Date.now()) {
     const val2 = response.headers.get(header);
     if (val2 == null) return [];
     const ts = new Date(val2).getTime();
-    if (Number.isNaN(ts)) return [];
-    if (ts <= now) return [now + CLOCK_SKEW_BUFFER];
+    if (Number.isNaN(ts)) {
+      poolLog(`parseCooldown: ${header}="${val2}" -> NaN (skipped)`);
+      return [];
+    }
+    if (ts <= now) {
+      poolLog(`parseCooldown: ${header}="${val2}" -> in past, using clock_skew_buffer`);
+      return [now + CLOCK_SKEW_BUFFER];
+    }
+    poolLog(`parseCooldown: ${header}="${val2}" -> ${new Date(ts).toISOString()} (${Math.round((ts - now) / 1e3)}s from now)`);
     return [ts];
   });
-  if (reset.length) return Math.min(...reset);
+  if (reset.length) {
+    const until = Math.min(Math.min(...reset), now + MAX_COOLDOWN_FROM_RESET);
+    poolLog(`parseCooldown: using earliest reset header (capped at ${MAX_COOLDOWN_FROM_RESET}ms) -> cooldown until ${new Date(until).toISOString()} (${Math.round((until - now) / 1e3)}s)`);
+    return until;
+  }
+  poolLog(`parseCooldown: no headers found, using fallback cooldown ${FALLBACK_COOLDOWN}ms`);
   return now + FALLBACK_COOLDOWN;
 }
 function firstUserText(messages) {
@@ -401,7 +484,7 @@ function describeRefreshFailure(status, bodyText) {
   return `HTTP ${status} ${preview}`;
 }
 var TOOL_PREFIX = "mcp_";
-function buildRequest(input, init, access) {
+function buildRequest(input, init, access, authMode = "oauth") {
   const requestInit = init ?? {};
   const requestHeaders = new Headers();
   if (input instanceof Request) {
@@ -430,14 +513,19 @@ function buildRequest(input, init, access) {
   }
   const incomingBeta = requestHeaders.get("anthropic-beta") || "";
   const incomingBetasList = incomingBeta.split(",").map((b) => b.trim()).filter(Boolean);
-  const requiredBetas = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14", "context-1m-2025-08-07"];
+  const requiredBetas = authMode === "apikey" ? ["interleaved-thinking-2025-05-14", "context-1m-2025-08-07"] : ["oauth-2025-04-20", "interleaved-thinking-2025-05-14", "context-1m-2025-08-07"];
   const mergedBetas = [
     .../* @__PURE__ */ new Set([...requiredBetas, ...incomingBetasList])
   ].join(",");
-  requestHeaders.set("authorization", `Bearer ${access}`);
+  if (authMode === "apikey") {
+    requestHeaders.set("x-api-key", access);
+    requestHeaders.delete("authorization");
+  } else {
+    requestHeaders.set("authorization", `Bearer ${access}`);
+    requestHeaders.delete("x-api-key");
+  }
   requestHeaders.set("anthropic-beta", mergedBetas);
   requestHeaders.set("user-agent", CLAUDE_CODE_AGENT);
-  requestHeaders.delete("x-api-key");
   let body = requestInit.body;
   if (body && typeof body === "string") {
     try {
@@ -521,7 +609,7 @@ function wrapStream(response) {
   }
   return response;
 }
-async function AnthropicAuthPlugin({ client }) {
+async function AnthropicAuthPlugin({ client: _client }) {
   return {
     "experimental.chat.system.transform": (input, output) => {
       const prefix = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -536,222 +624,238 @@ async function AnthropicAuthPlugin({ client }) {
       async loader(getAuth, provider) {
         poolLog("loader called");
         const auth = await getAuth();
-        const pool = loadPool();
-        if (auth && auth.type === "oauth" || pool) {
+        let pool = loadPool();
+        if ((!pool || !pool.accounts.length) && auth && auth.type === "oauth" && auth.refresh) {
+          open().prepare(
+            "INSERT OR IGNORE INTO account (id, label, refresh, access, expires, status, type) VALUES (?, ?, ?, ?, ?, 'active', 'oauth')"
+          ).run(randomUUID(), "migrated", auth.refresh, auth.access || "", auth.expires || 0);
+          poolLog("auto-migrated auth-store OAuth credential to pool DB");
+          pool = loadPool();
+        }
+        if (pool) {
           for (const model of Object.values(provider.models)) {
             model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } };
           }
-          if (pool) {
-            pool.accounts.sort((a, b) => {
-              if (a.overage !== b.overage) return a.overage ? 1 : -1;
-              return Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d);
-            });
-            let current = pool.accounts[0];
-            poolLog(
-              `pool mode: ${pool.accounts.length} accounts, starting with "${current.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`
-            );
-            return {
-              apiKey: "",
-              async fetch(input, init) {
-                if (!current.access || current.expires < Date.now()) {
-                  const ok = await refreshToken(current);
-                  if (!ok) {
-                    const prev = current;
-                    setCooldown(current.id, Date.now() + FALLBACK_COOLDOWN);
-                    current.cooloffUntil = Date.now() + FALLBACK_COOLDOWN;
-                    current = pickNext(pool, current);
-                    poolLog(
-                      `refresh failed, switching from "${prev.label}" to "${current.label}"`
-                    );
+          const dummy = { util5h: Infinity, util7d: Infinity, overage: true, cooloffUntil: Infinity, type: "apikey" };
+          let current = pickNext(pool, dummy);
+          if (current === dummy) current = pool.accounts[0];
+          poolLog(
+            `pool mode: ${pool.accounts.length} accounts, starting with "${current.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`
+          );
+          return {
+            apiKey: "",
+            async fetch(input, init) {
+              poolLog(`fetch start: using "${current.label}" (${current.type})`);
+              if (current.type !== "apikey" && (!current.access || current.expires < Date.now())) {
+                const ok = await refreshToken(current);
+                if (!ok) {
+                  const prev = current;
+                  const until = Date.now() + FALLBACK_COOLDOWN;
+                  setCooldown(current.id, until);
+                  current.cooloffUntil = until;
+                  current = pickNext(pool, current);
+                  poolLog(
+                    `refresh failed, switching from "${prev.label}" to "${current.label}"`
+                  );
+                  if (current.type !== "apikey" && (!current.access || current.expires < Date.now())) {
                     const ok2 = await refreshToken(current);
                     if (!ok2) throw new Error("All accounts failed to refresh");
                   }
                 }
-                const req = buildRequest(input, init, current.access);
-                const response = await fetch(req.requestInput, {
-                  ...init ?? {},
-                  body: req.body,
-                  headers: req.requestHeaders
-                });
-                parseUtil(response, current);
-                saveUtil(current);
-                if (response.status === 401 || response.status === 403) {
-                  const ok = await refreshToken(current);
-                  if (ok) {
-                    const retry = buildRequest(input, init, current.access);
-                    const r2 = await fetch(retry.requestInput, {
-                      ...init ?? {},
-                      body: retry.body,
-                      headers: retry.requestHeaders
-                    });
-                    parseUtil(r2, current);
-                    saveUtil(current);
-                    return wrapStream(r2);
-                  }
-                  const until = parseCooldown(response);
-                  setCooldown(current.id, until);
-                  current.cooloffUntil = until;
-                  const tried401 = /* @__PURE__ */ new Set([current.id]);
-                  let last401 = response;
-                  while (tried401.size < pool.accounts.length) {
-                    const prev = current;
-                    current = pickNext(pool, current);
-                    if (current === prev || tried401.has(current.id)) break;
-                    tried401.add(current.id);
-                    poolLog(
-                      `401/403 trying "${current.label}" after "${prev.label}" failed`
-                    );
-                    const ok2 = await refreshToken(current);
-                    if (!ok2) continue;
-                    const retry = buildRequest(input, init, current.access);
-                    const r2 = await fetch(retry.requestInput, {
-                      ...init ?? {},
-                      body: retry.body,
-                      headers: retry.requestHeaders
-                    });
-                    parseUtil(r2, current);
-                    saveUtil(current);
-                    if (r2.status !== 401 && r2.status !== 403)
-                      return wrapStream(r2);
-                    last401 = r2;
-                    const until2 = parseCooldown(r2);
-                    setCooldown(current.id, until2);
-                    current.cooloffUntil = until2;
-                  }
-                  return wrapStream(last401);
-                }
-                if (response.status === 429) {
-                  const retryAfterMs = parseFloat(response.headers.get("retry-after") || "0") * 1e3;
-                  const transient = retryAfterMs > 0 && retryAfterMs <= TRANSIENT_THRESHOLD;
-                  let latestResp;
-                  if (transient) {
-                    await new Promise((r) => setTimeout(r, retryAfterMs));
-                    const sameRetry = buildRequest(input, init, current.access);
-                    const sameResp = await fetch(sameRetry.requestInput, {
-                      ...init ?? {},
-                      body: sameRetry.body,
-                      headers: sameRetry.requestHeaders
-                    });
-                    if (sameResp.status !== 429) {
-                      parseUtil(sameResp, current);
-                      saveUtil(current);
-                      return wrapStream(sameResp);
-                    }
-                    latestResp = sameResp;
-                  } else {
-                    latestResp = response;
-                  }
-                  const until = parseCooldown(latestResp);
-                  setCooldown(current.id, until);
-                  current.cooloffUntil = until;
-                  const tried = /* @__PURE__ */ new Set([current.id]);
-                  let last429 = latestResp;
-                  while (tried.size < pool.accounts.length) {
-                    const prev = current;
-                    current = pickNext(pool, current);
-                    if (current === prev || tried.has(current.id)) break;
-                    tried.add(current.id);
-                    poolLog(
-                      `429 trying "${current.label}" after "${prev.label}" rate limited`
-                    );
-                    if (!current.access || current.expires < Date.now()) {
-                      const ok = await refreshToken(current);
-                      if (!ok) continue;
-                    }
-                    const retry = buildRequest(input, init, current.access);
-                    const r2 = await fetch(retry.requestInput, {
-                      ...init ?? {},
-                      body: retry.body,
-                      headers: retry.requestHeaders
-                    });
-                    parseUtil(r2, current);
-                    saveUtil(current);
-                    if (r2.status !== 429) return wrapStream(r2);
-                    const u = parseCooldown(r2);
-                    setCooldown(current.id, u);
-                    current.cooloffUntil = u;
-                    last429 = r2;
-                  }
-                  const now = Date.now();
-                  const times = pool.accounts.map((a) => a.cooloffUntil).filter((t) => t > now);
-                  const earliest = times.length ? Math.min(...times) : now + FALLBACK_COOLDOWN;
-                  const secs = Math.max(
-                    1,
-                    Math.min(
-                      Math.ceil((earliest - now) / 1e3),
-                      MAX_RETRY_AFTER
-                    )
-                  );
-                  const hdrs = new Headers(last429.headers);
-                  hdrs.set("retry-after", String(secs));
-                  return new Response(last429.body, {
-                    status: 429,
-                    statusText: last429.statusText,
-                    headers: hdrs
-                  });
-                }
-                if (current.overage || Math.max(current.util5h, current.util7d) > pool.config.threshold) {
-                  const candidate = pickNext(pool, current);
-                  if (candidate !== current && !candidate.overage && Math.max(candidate.util5h, candidate.util7d) < pool.config.threshold) {
-                    poolLog(
-                      `proactive switch from "${current.label}" to "${candidate.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`
-                    );
-                    current = candidate;
-                  }
-                }
-                return wrapStream(response);
               }
-            };
-          }
-          return {
-            apiKey: "",
-            async fetch(input, init) {
-              const auth2 = await getAuth();
-              if (auth2.type !== "oauth") return fetch(input, init);
-              if (!auth2.access || auth2.expires < Date.now()) {
-                const json = await refreshAccessToken(auth2.refresh);
-                await client.auth.set({
-                  path: { id: "anthropic" },
-                  body: {
-                    type: "oauth",
-                    refresh: json.refresh,
-                    access: json.access,
-                    expires: json.expires
-                  }
-                });
-                auth2.access = json.access;
-              }
-              const req = buildRequest(input, init, auth2.access);
+              const req = buildRequest(input, init, current.access, current.type);
               const response = await fetch(req.requestInput, {
                 ...init ?? {},
                 body: req.body,
                 headers: req.requestHeaders
               });
+              poolLog(`fetch "${current.label}" (${current.type}): ${response.status} ${response.statusText}`);
+              parseUtil(response, current);
+              saveUtil(current);
               if (response.status === 401 || response.status === 403) {
-                const cur = await getAuth();
-                if (cur.type !== "oauth") return wrapStream(response);
-                let json;
-                try {
-                  json = await refreshAccessToken(cur.refresh);
-                } catch {
+                if (current.type === "apikey") {
+                  const db2 = open();
+                  db2.prepare(
+                    "UPDATE account SET consecutive_failures = consecutive_failures + 1 WHERE id = ?"
+                  ).run(current.id);
+                  const row = db2.prepare("SELECT consecutive_failures FROM account WHERE id = ?").get(current.id);
+                  const failures = row?.consecutive_failures ?? 0;
+                  if (failures >= DEAD_AFTER_FAILURES) {
+                    markDead(current.id, `${failures} consecutive 401/403 failures`);
+                    current.status = "dead";
+                  }
+                  const until2 = Date.now() + FALLBACK_COOLDOWN;
+                  setCooldown(current.id, until2);
+                  current.cooloffUntil = until2;
+                  current = pickNext(pool, current);
                   return wrapStream(response);
                 }
-                await client.auth.set({
-                  path: { id: "anthropic" },
-                  body: {
-                    type: "oauth",
-                    refresh: json.refresh,
-                    access: json.access,
-                    expires: json.expires
+                const ok = await refreshToken(current);
+                if (ok) {
+                  const retry = buildRequest(input, init, current.access, current.type);
+                  const r2 = await fetch(retry.requestInput, {
+                    ...init ?? {},
+                    body: retry.body,
+                    headers: retry.requestHeaders
+                  });
+                  parseUtil(r2, current);
+                  saveUtil(current);
+                  return wrapStream(r2);
+                }
+                const until = parseCooldown(response);
+                setCooldown(current.id, until);
+                current.cooloffUntil = until;
+                const tried401 = /* @__PURE__ */ new Set([current.id]);
+                let last401 = response;
+                while (tried401.size < pool.accounts.length) {
+                  const prev = current;
+                  current = pickNext(pool, current);
+                  if (current === prev || tried401.has(current.id)) break;
+                  tried401.add(current.id);
+                  poolLog(
+                    `401/403 trying "${current.label}" after "${prev.label}" failed`
+                  );
+                  if (current.type !== "apikey" && (!current.access || current.expires < Date.now())) {
+                    const ok2 = await refreshToken(current);
+                    if (!ok2) continue;
                   }
+                  const retry = buildRequest(input, init, current.access, current.type);
+                  const r2 = await fetch(retry.requestInput, {
+                    ...init ?? {},
+                    body: retry.body,
+                    headers: retry.requestHeaders
+                  });
+                  parseUtil(r2, current);
+                  saveUtil(current);
+                  if (r2.status !== 401 && r2.status !== 403) return wrapStream(r2);
+                  last401 = r2;
+                  const retryUntil = parseCooldown(r2);
+                  setCooldown(current.id, retryUntil);
+                  current.cooloffUntil = retryUntil;
+                }
+                return wrapStream(last401);
+              }
+              if (response.status === 429) {
+                const retryAfterMs = parseFloat(response.headers.get("retry-after") || "0") * 1e3;
+                const transient = retryAfterMs > 0 && retryAfterMs <= TRANSIENT_THRESHOLD;
+                poolLog(`429 on "${current.label}": retry-after=${response.headers.get("retry-after")}, retry-after-ms=${response.headers.get("retry-after-ms")}, transient=${transient}`);
+                let latestResp;
+                if (transient) {
+                  await new Promise((r) => setTimeout(r, retryAfterMs));
+                  const sameRetry = buildRequest(input, init, current.access, current.type);
+                  const sameResp = await fetch(sameRetry.requestInput, {
+                    ...init ?? {},
+                    body: sameRetry.body,
+                    headers: sameRetry.requestHeaders
+                  });
+                  if (sameResp.status !== 429) {
+                    parseUtil(sameResp, current);
+                    saveUtil(current);
+                    return wrapStream(sameResp);
+                  }
+                  latestResp = sameResp;
+                } else {
+                  latestResp = response;
+                }
+                const until = parseCooldown(latestResp);
+                setCooldown(current.id, until);
+                current.cooloffUntil = until;
+                const tried = /* @__PURE__ */ new Set([current.id]);
+                let last429 = latestResp;
+                while (tried.size < pool.accounts.length) {
+                  const prev = current;
+                  current = pickNext(pool, current);
+                  if (current === prev || tried.has(current.id)) break;
+                  tried.add(current.id);
+                  poolLog(
+                    `429 trying "${current.label}" after "${prev.label}" rate limited`
+                  );
+                  if (current.type !== "apikey" && (!current.access || current.expires < Date.now())) {
+                    const ok = await refreshToken(current);
+                    if (!ok) continue;
+                  }
+                  const retry = buildRequest(input, init, current.access, current.type);
+                  const r2 = await fetch(retry.requestInput, {
+                    ...init ?? {},
+                    body: retry.body,
+                    headers: retry.requestHeaders
+                  });
+                  parseUtil(r2, current);
+                  saveUtil(current);
+                  if (r2.status !== 429) return wrapStream(r2);
+                  const retryUntil = parseCooldown(r2);
+                  setCooldown(current.id, retryUntil);
+                  current.cooloffUntil = retryUntil;
+                  last429 = r2;
+                }
+                const now = Date.now();
+                if (isAllOAuthExhausted(pool)) {
+                  const apikeyAccount = pool.accounts.find(
+                    (a) => (a.type || "oauth") === "apikey" && now >= a.cooloffUntil && a.status !== "dead"
+                  );
+                  if (apikeyAccount) {
+                    const prevForFallback = current;
+                    current = apikeyAccount;
+                    poolLog(`all OAuth exhausted, falling back to apikey "${current.label}"`);
+                    const fallbackReq = buildRequest(input, init, current.access, current.type);
+                    const fallbackResp = await fetch(fallbackReq.requestInput, {
+                      ...init ?? {},
+                      body: fallbackReq.body,
+                      headers: fallbackReq.requestHeaders
+                    });
+                    parseUtil(fallbackResp, current);
+                    saveUtil(current);
+                    if (fallbackResp.status !== 429) return wrapStream(fallbackResp);
+                    current = prevForFallback;
+                    last429 = fallbackResp;
+                  }
+                }
+                const times = pool.accounts.map((a) => a.cooloffUntil).filter((t) => t > now);
+                const earliest = times.length ? Math.min(...times) : now + FALLBACK_COOLDOWN;
+                const secs = Math.max(
+                  1,
+                  Math.min(Math.ceil((earliest - now) / 1e3), MAX_RETRY_AFTER)
+                );
+                poolLog(`429 all accounts exhausted, returning retry-after=${secs}s to client (earliest cooldown: ${new Date(earliest).toISOString()})`);
+                const hdrs = new Headers(last429.headers);
+                hdrs.set("retry-after", String(secs));
+                return new Response(last429.body, {
+                  status: 429,
+                  statusText: last429.statusText,
+                  headers: hdrs
                 });
-                const retry = buildRequest(input, init, json.access);
-                const r2 = await fetch(retry.requestInput, {
-                  ...init ?? {},
-                  body: retry.body,
-                  headers: retry.requestHeaders
-                });
-                return wrapStream(r2);
+              }
+              if (current.overage) {
+                const candidate = pickNext(pool, current);
+                if (candidate !== current && !candidate.overage) {
+                  poolLog(
+                    `proactive switch from "${current.label}" to "${candidate.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`
+                  );
+                  current = candidate;
+                }
+              }
+              if (current.type === "apikey") {
+                const now = Date.now();
+                const recoveredRows = open().prepare(
+                  "SELECT id, cooldown_until, overage, overage_at, status FROM account WHERE type != 'apikey'"
+                ).all();
+                const recoveredIds = new Set(
+                  recoveredRows.filter(
+                    (row) => row.status !== "dead" && row.cooldown_until <= now && !row.overage
+                  ).map((row) => row.id)
+                );
+                const recoveredOAuth = pool.accounts.find((a) => recoveredIds.has(a.id));
+                if (recoveredOAuth) {
+                  const recoveredRow = recoveredRows.find((row) => row.id === recoveredOAuth.id);
+                  if (recoveredRow) {
+                    recoveredOAuth.cooloffUntil = recoveredRow.cooldown_until || 0;
+                    recoveredOAuth.overage = !!recoveredRow.overage;
+                    recoveredOAuth.overageAt = recoveredRow.overage_at || 0;
+                    recoveredOAuth.status = recoveredRow.status || "active";
+                  }
+                  poolLog(`OAuth recovered, switching from apikey "${current.label}" to "${recoveredOAuth.label}"`);
+                  current = recoveredOAuth;
+                }
               }
               return wrapStream(response);
             }
@@ -808,7 +912,25 @@ async function AnthropicAuthPlugin({ client }) {
     }
   };
 }
-var __test = { authHeaders, buildBillingHeader, buildRequest, describeRefreshFailure };
+var __test = {
+  authHeaders,
+  buildBillingHeader,
+  buildRequest,
+  describeRefreshFailure,
+  pickNext,
+  isAllOAuthExhausted,
+  loadPool,
+  parseUtil,
+  parseCooldown,
+  STALE_5H,
+  STALE_7D,
+  STALE_OVERAGE,
+  TRANSIENT_THRESHOLD,
+  FALLBACK_COOLDOWN,
+  MAX_RETRY_AFTER,
+  MAX_COOLDOWN_FROM_RESET,
+  DEAD_AFTER_FAILURES
+};
 export {
   AnthropicAuthPlugin,
   __test

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { open, tryAcquireRefreshLock, releaseRefreshLock } from "./db.mjs";
+import { open, tryAcquireRefreshLock, releaseRefreshLock, config } from "./db.mjs";
 import {
   CLAUDE_CODE_AGENT,
   CLAUDE_CODE_VERSION,
@@ -119,9 +119,11 @@ function pickNext(pool, current) {
     return current;
   }
 
+  const preferApikeyOverOverage = config("prefer_apikey_over_overage", false);
   const oauthAvailable = available.filter((a) => (a.type || "oauth") !== "apikey");
+  const healthyOAuth = preferApikeyOverOverage ? oauthAvailable.filter((a) => !a.overage) : oauthAvailable;
   const apikeyAvailable = available.filter((a) => (a.type || "oauth") === "apikey");
-  const candidates = oauthAvailable.length > 0 ? oauthAvailable : apikeyAvailable;
+  const candidates = healthyOAuth.length > 0 ? healthyOAuth : apikeyAvailable.length > 0 ? apikeyAvailable : oauthAvailable;
   if (!candidates.length) return current;
 
   // Prefer non-overage accounts
@@ -134,7 +136,11 @@ function pickNext(pool, current) {
     return notInOverage[0];
   }
 
-  // All in overage — pick lowest utilization
+  // All candidates in overage — don't switch just to bounce between overage accounts
+  if (current.overage && (current.type || "oauth") !== "apikey") {
+    poolLog(`pickNext: all in overage, staying on current "${current.label}"`);
+    return current;
+  }
   candidates.sort(
     (a, b) => Math.max(a.util5h, a.util7d) - Math.max(b.util5h, b.util7d),
   );

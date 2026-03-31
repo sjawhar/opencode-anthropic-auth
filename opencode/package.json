@@ -1,5 +1,5 @@
 {
-  "name": "opencode-anthropic-auth",
+  "name": "@sjawhar/opencode-anthropic-auth",
   "version": "0.0.14",
   "main": "./index.mjs",
   "scripts": {

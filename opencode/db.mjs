@@ -63,6 +63,13 @@ export function releaseRefreshLock(id) {
   db.prepare("UPDATE account SET refresh_lock = 0 WHERE id = ?").run(id);
 }
 
-export function config(_key, fallback) {
-  return fallback;
+export function config(key, fallback) {
+  const db = open();
+  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
+  const row = db.prepare("SELECT value FROM config WHERE key = ?").get(key);
+  if (!row) return fallback;
+  if (row.value === "true") return true;
+  if (row.value === "false") return false;
+  const num = Number(row.value);
+  return Number.isNaN(num) ? row.value : num;
 }
