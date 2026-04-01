@@ -105,6 +105,44 @@ function setCooldown(id, until) {
   );
 }
 
+function persistAccountCredentials(db, label, credentials, now = Date.now(), type = "oauth") {
+  let id;
+  let access;
+  let refresh;
+  let expires;
+
+  if (type === "apikey") {
+    id = randomUUID();
+    access = credentials.apiKey;
+    refresh = "";
+    expires = 0;
+  } else {
+    id = credentials.account?.uuid;
+    if (!id) {
+      throw new Error("Authorization succeeded but account UUID is missing.");
+    }
+    access = credentials.access_token || "";
+    refresh = credentials.refresh_token;
+    expires = credentials.expires_in ? now + credentials.expires_in * 1000 : 0;
+  }
+
+  db.prepare(
+    "INSERT OR REPLACE INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?)",
+  ).run(
+    id,
+    label.trim() || "unnamed",
+    refresh,
+    access,
+    expires,
+    type,
+  );
+
+  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
+  db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+
+  return id;
+}
+
 // --- Account selection ---
 
 function pickNext(pool, current) {
@@ -565,7 +603,8 @@ export async function AnthropicAuthPlugin({ client: _client }) {
         const auth = await getAuth();
         let pool = loadPool();
 
-        if ((!pool || !pool.accounts.length) && auth && auth.type === "oauth" && auth.refresh) {
+        const poolInitialized = config("pool_initialized", false);
+        if ((!pool || !pool.accounts.length) && !poolInitialized && auth && auth.type === "oauth" && auth.refresh) {
           open()
             .prepare(
               "INSERT OR IGNORE INTO account (id, label, refresh, access, expires, status, type) VALUES (?, ?, ?, ?, ?, 'active', 'oauth')",
@@ -888,7 +927,7 @@ export async function AnthropicAuthPlugin({ client: _client }) {
 
 export const __test = {
   authHeaders, buildBillingHeader, buildRequest, describeRefreshFailure,
-  pickNext, isAllOAuthExhausted,
+  pickNext, isAllOAuthExhausted, persistAccountCredentials,
   loadPool, parseUtil, parseCooldown,
   STALE_5H, STALE_7D, STALE_OVERAGE, TRANSIENT_THRESHOLD,
   FALLBACK_COOLDOWN, MAX_RETRY_AFTER, MAX_COOLDOWN_FROM_RESET, DEAD_AFTER_FAILURES,
