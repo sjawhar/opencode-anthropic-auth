@@ -1,12 +1,17 @@
-name: Tests
+name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: opencode
     steps:
       - uses: actions/checkout@v4
 
@@ -15,7 +20,17 @@ jobs:
           bun-version: latest
 
       - run: bun install
-        working-directory: opencode
 
       - run: bun run test
-        working-directory: opencode
+
+      - run: bun run build
+
+      - name: Verify no forbidden patterns
+        run: |
+          ! grep -rn 'as any\|@ts-ignore\|@ts-expect-error' index.mjs db.mjs || (echo "Found forbidden type suppressions" && exit 1)
+          ! grep -rn 'console\.log' index.mjs db.mjs || (echo "Found console.log in production code" && exit 1)
+
+      - name: Verify dist is up to date
+        run: |
+          bun run build
+          git diff --exit-code dist/ || (echo "dist/ is out of date — run 'bun run build' and commit" && exit 1)
