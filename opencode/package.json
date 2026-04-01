@@ -1,14 +1,21 @@
 {
   "name": "@sjawhar/opencode-anthropic-auth",
   "version": "0.1.1-test",
-  "main": "./dist/index.mjs",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./tui": "./dist/tui.mjs"
+  },
   "scripts": {
-    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:better-sqlite3 --external:bun:sqlite",
+    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:better-sqlite3 --external:bun:sqlite && esbuild tui.jsx --bundle --platform=node --format=esm --outfile=dist/tui.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:@opentui/* --external:better-sqlite3 --external:bun:sqlite --jsx=automatic",
     "test": "bun test index.test.mjs add-account.test.mjs && bun test pure.test.mjs e2e-smoke.test.mjs e2e-auth.test.mjs e2e-ratelimit.test.mjs e2e-state.test.mjs fence.test.mjs"
   },
   "files": [
     "dist"
   ],
+  "peerDependencies": {
+    "@opentui/core": ">=0.1.92",
+    "@opentui/solid": ">=0.1.92"
+  },
   "devDependencies": {
     "@opencode-ai/plugin": "^0.4.45",
     "esbuild": "^0.25.0"
