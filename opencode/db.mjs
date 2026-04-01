@@ -73,3 +73,125 @@ export function config(key, fallback) {
   const num = Number(row.value);
   return Number.isNaN(num) ? row.value : num;
 }
+
+// --- Management operations ---
+
+const STALE_5H = 3600000; // 1 hour
+const STALE_7D = 43200000; // 12 hours
+
+/**
+ * List all accounts (all statuses) with required fields.
+ * Excludes refresh and access tokens.
+ */
+export function listAccounts(dbInstance) {
+  const db = dbInstance || open();
+  const rows = db.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures
+    FROM account
+  `).all();
+  return rows;
+}
+
+/**
+ * Hard delete an account by ID.
+ * Returns { deleted: boolean, remaining: number }
+ */
+export function removeAccount(dbInstance, id) {
+  const db = dbInstance || open();
+  const result = db.prepare("DELETE FROM account WHERE id = ?").run(id);
+  const remaining = db.prepare("SELECT COUNT(*) as count FROM account").get();
+  return {
+    deleted: result.changes === 1,
+    remaining: remaining.count,
+  };
+}
+
+/**
+ * Reset an account: status='active', cooldown_until=0, consecutive_failures=0, refresh_lock=0.
+ * Preserves tokens, label, type, utilization.
+ * Returns redacted account (no tokens).
+ * Throws if account does not exist.
+ */
+export function resetAccount(dbInstance, id) {
+  const db = dbInstance || open();
+  const existing = db.prepare("SELECT id FROM account WHERE id = ?").get(id);
+  if (!existing) throw new Error(`Account not found: ${id}`);
+
+  db.prepare(`
+    UPDATE account
+    SET status = 'active', cooldown_until = 0, consecutive_failures = 0, refresh_lock = 0
+    WHERE id = ?
+  `).run(id);
+
+  const updated = db.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures, refresh_lock
+    FROM account WHERE id = ?
+  `).get(id);
+
+  return updated;
+}
+
+/**
+ * Get account health with computed staleness and cooldown info.
+ * Returns account with: isStale5h, isStale7d, isCoolingDown, cooldownRemaining, isDead.
+ * No tokens included.
+ * Throws if account does not exist.
+ */
+export function getAccountHealth(dbInstance, id) {
+  const db = dbInstance || open();
+  const row = db.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures
+    FROM account WHERE id = ?
+  `).get(id);
+
+  if (!row) throw new Error(`Account not found: ${id}`);
+
+  const now = Date.now();
+  const isStale5h = now - row.util5h_at > STALE_5H;
+  const isStale7d = now - row.util7d_at > STALE_7D;
+  const isCoolingDown = row.cooldown_until > now;
+  const cooldownRemaining = isCoolingDown ? row.cooldown_until - now : 0;
+  const isDead = row.status === 'dead';
+
+  return {
+    ...row,
+    isStale5h,
+    isStale7d,
+    isCoolingDown,
+    cooldownRemaining,
+    isDead,
+  };
+}
+
+/**
+ * Set a config value. Only accepts allowlisted keys.
+ * Throws on unknown keys.
+ */
+export function setConfig(dbInstance, key, value) {
+  const allowlist = ['prefer_apikey_over_overage'];
+  if (!allowlist.includes(key)) {
+    throw new Error(`Unknown config key: ${key}`);
+  }
+
+  const db = dbInstance || open();
+  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
+  db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
+}
+
+/**
+ * List all config rows as { key, value } array.
+ */
+export function listConfig(dbInstance) {
+  const db = dbInstance || open();
+  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
+  return db.prepare("SELECT key, value FROM config").all();
+}
