@@ -1,16 +1,18 @@
-// index.mjs
-import { createHash as createHash2, randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { join as join2 } from "node:path";
-import { homedir as homedir2 } from "node:os";
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 
 // db.mjs
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-var DB_PATH = join(homedir(), ".opencode", "data", "anthropic-pool.db");
-var db;
 function open() {
   if (db) return db;
   const dir = join(homedir(), ".opencode", "data");
@@ -49,7 +51,6 @@ function open() {
   }
   return db;
 }
-var LOCK_TIMEOUT = 3e4;
 function tryAcquireRefreshLock(id) {
   const db2 = open();
   const now = Date.now();
@@ -75,6 +76,224 @@ function config(key, fallback) {
   const num = Number(row.value);
   return Number.isNaN(num) ? row.value : num;
 }
+function listAccounts(dbInstance) {
+  const db2 = dbInstance || open();
+  const rows = db2.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures
+    FROM account
+  `).all();
+  return rows;
+}
+function removeAccount(dbInstance, id) {
+  const db2 = dbInstance || open();
+  const result = db2.prepare("DELETE FROM account WHERE id = ?").run(id);
+  const remaining = db2.prepare("SELECT COUNT(*) as count FROM account").get();
+  return {
+    deleted: result.changes === 1,
+    remaining: remaining.count
+  };
+}
+function resetAccount(dbInstance, id) {
+  const db2 = dbInstance || open();
+  const existing = db2.prepare("SELECT id FROM account WHERE id = ?").get(id);
+  if (!existing) throw new Error(`Account not found: ${id}`);
+  db2.prepare(`
+    UPDATE account
+    SET status = 'active', cooldown_until = 0, consecutive_failures = 0, refresh_lock = 0
+    WHERE id = ?
+  `).run(id);
+  const updated = db2.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures, refresh_lock
+    FROM account WHERE id = ?
+  `).get(id);
+  return updated;
+}
+function getAccountHealth(dbInstance, id) {
+  const db2 = dbInstance || open();
+  const row = db2.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures
+    FROM account WHERE id = ?
+  `).get(id);
+  if (!row) throw new Error(`Account not found: ${id}`);
+  const now = Date.now();
+  const isStale5h = now - row.util5h_at > STALE_5H;
+  const isStale7d = now - row.util7d_at > STALE_7D;
+  const isCoolingDown = row.cooldown_until > now;
+  const cooldownRemaining = isCoolingDown ? row.cooldown_until - now : 0;
+  const isDead = row.status === "dead";
+  return {
+    ...row,
+    isStale5h,
+    isStale7d,
+    isCoolingDown,
+    cooldownRemaining,
+    isDead
+  };
+}
+function setConfig(dbInstance, key, value) {
+  const allowlist = ["prefer_apikey_over_overage"];
+  if (!allowlist.includes(key)) {
+    throw new Error(`Unknown config key: ${key}`);
+  }
+  const db2 = dbInstance || open();
+  try {
+    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  } catch {
+  }
+  db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
+}
+function listConfig(dbInstance) {
+  const db2 = dbInstance || open();
+  try {
+    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  } catch {
+  }
+  return db2.prepare("SELECT key, value FROM config").all();
+}
+var DB_PATH, db, LOCK_TIMEOUT, STALE_5H, STALE_7D;
+var init_db = __esm({
+  "db.mjs"() {
+    DB_PATH = join(homedir(), ".opencode", "data", "anthropic-pool.db");
+    LOCK_TIMEOUT = 3e4;
+    STALE_5H = 36e5;
+    STALE_7D = 432e5;
+  }
+});
+
+// management.mjs
+var management_exports = {};
+__export(management_exports, {
+  __test: () => __test,
+  formatAccountStatus: () => formatAccountStatus,
+  formatRelativeTime: () => formatRelativeTime,
+  getConfig: () => getConfig,
+  listAccountsWithHealth: () => listAccountsWithHealth,
+  redactAccount: () => redactAccount,
+  removeAccount: () => removeAccount2,
+  resetAccount: () => resetAccount2,
+  setConfig: () => setConfig2
+});
+function formatDuration(durationMs) {
+  const totalSeconds = Math.max(0, Math.ceil(durationMs / 1e3));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+function parseConfigValue(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  const numeric = Number(value);
+  return Number.isNaN(numeric) ? value : numeric;
+}
+function formatRelativeTime(timestampMs) {
+  if (!timestampMs) return "never";
+  const elapsed = Math.max(0, Date.now() - timestampMs);
+  if (elapsed < 6e4) return "just now";
+  if (elapsed < 60 * 6e4) return `${Math.floor(elapsed / 6e4)}m ago`;
+  if (elapsed < 24 * 60 * 6e4) return `${Math.floor(elapsed / (60 * 6e4))}h ago`;
+  if (elapsed < 48 * 60 * 6e4) return "yesterday";
+  return `${Math.floor(elapsed / (24 * 60 * 6e4))}d ago`;
+}
+function formatAccountStatus(account) {
+  if (account.status === "dead") return "[dead]";
+  const now = Date.now();
+  if (account.cooldown_until > now) {
+    return `[cooling down: ${formatDuration(account.cooldown_until - now)}]`;
+  }
+  if (account.status === "active" && account.consecutive_failures > 0) {
+    return "[rate-limited]";
+  }
+  if (account.status === "active") return "[active]";
+  return `[${account.status ?? "unknown"}]`;
+}
+function redactAccount(account) {
+  const redacted = { ...account };
+  const maskedAccess = redacted.type === "apikey" && redacted.access ? `sk-ant-...${String(redacted.access).slice(-4)}` : void 0;
+  delete redacted.refresh;
+  delete redacted.access;
+  if (maskedAccess) redacted.maskedAccess = maskedAccess;
+  return redacted;
+}
+function listAccountsWithHealth(dbInstance) {
+  return listAccounts(dbInstance).map((account) => {
+    const health = getAccountHealth(dbInstance, account.id);
+    const decorated = {
+      ...account,
+      isStale5h: health.isStale5h,
+      isStale7d: health.isStale7d,
+      isCoolingDown: health.isCoolingDown,
+      cooldownRemaining: health.cooldownRemaining,
+      isDead: health.isDead,
+      util5h: health.isStale5h ? 0 : account.util5h,
+      util7d: health.isStale7d ? 0 : account.util7d,
+      statusBadge: formatAccountStatus(health),
+      util5hRelative: formatRelativeTime(account.util5h_at),
+      util7dRelative: formatRelativeTime(account.util7d_at),
+      overageRelative: formatRelativeTime(account.overage_at)
+    };
+    return redactAccount(decorated);
+  });
+}
+function removeAccount2(id, dbInstance) {
+  return removeAccount(dbInstance, id);
+}
+function resetAccount2(id, dbInstance) {
+  const account = resetAccount(dbInstance, id);
+  return {
+    reset: true,
+    account: redactAccount(account)
+  };
+}
+function getConfig(dbInstance) {
+  const entries = listConfig(dbInstance).map(({ key, value }) => ({
+    key,
+    value: parseConfigValue(value),
+    description: CONFIG_DESCRIPTIONS[key] ?? key
+  }));
+  return {
+    values: Object.fromEntries(entries.map(({ key, value }) => [key, value])),
+    entries
+  };
+}
+function setConfig2(key, value, dbInstance) {
+  setConfig(dbInstance, key, value);
+  return getConfig(dbInstance);
+}
+var STALE_5H2, STALE_7D2, CONFIG_DESCRIPTIONS, __test;
+var init_management = __esm({
+  "management.mjs"() {
+    init_db();
+    STALE_5H2 = 36e5;
+    STALE_7D2 = 432e5;
+    CONFIG_DESCRIPTIONS = {
+      prefer_apikey_over_overage: "Prefer API key accounts over OAuth accounts currently using overage."
+    };
+    __test = {
+      CONFIG_DESCRIPTIONS,
+      STALE_5H: STALE_5H2,
+      STALE_7D: STALE_7D2,
+      formatDuration,
+      parseConfigValue
+    };
+  }
+});
+
+// index.mjs
+init_db();
+import { createHash as createHash2, randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { join as join2 } from "node:path";
+import { homedir as homedir2 } from "node:os";
 
 // ../shared/oauth.mjs
 import { createHash, randomBytes } from "node:crypto";
@@ -190,8 +409,8 @@ function poolLog(msg) {
   } catch {
   }
 }
-var STALE_5H = 36e5;
-var STALE_7D = 432e5;
+var STALE_5H3 = 36e5;
+var STALE_7D3 = 432e5;
 var STALE_OVERAGE = 18e5;
 var TRANSIENT_THRESHOLD = 1e4;
 var CLOCK_SKEW_BUFFER = 2e3;
@@ -210,8 +429,8 @@ function loadPool() {
       refresh: r.refresh,
       access: r.access || "",
       expires: r.expires || 0,
-      util5h: now - r.util5h_at < STALE_5H ? r.util5h : 0,
-      util7d: now - r.util7d_at < STALE_7D ? r.util7d : 0,
+      util5h: now - r.util5h_at < STALE_5H3 ? r.util5h : 0,
+      util7d: now - r.util7d_at < STALE_7D3 ? r.util7d : 0,
       cooloffUntil: r.cooldown_until || 0,
       overage: now - r.overage_at < STALE_OVERAGE ? !!r.overage : false,
       overageAt: r.overage_at || 0,
@@ -258,6 +477,42 @@ function setCooldown(id, until) {
     until,
     id
   );
+}
+function persistAccountCredentials(db2, label, credentials, now = Date.now(), type = "oauth") {
+  let id;
+  let access;
+  let refresh;
+  let expires;
+  if (type === "apikey") {
+    id = randomUUID();
+    access = credentials.apiKey;
+    refresh = "";
+    expires = 0;
+  } else {
+    id = credentials.account?.uuid;
+    if (!id) {
+      throw new Error("Authorization succeeded but account UUID is missing.");
+    }
+    access = credentials.access_token || "";
+    refresh = credentials.refresh_token;
+    expires = credentials.expires_in ? now + credentials.expires_in * 1e3 : 0;
+  }
+  db2.prepare(
+    "INSERT OR REPLACE INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?)"
+  ).run(
+    id,
+    label.trim() || "unnamed",
+    refresh,
+    access,
+    expires,
+    type
+  );
+  try {
+    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  } catch {
+  }
+  db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+  return id;
 }
 function pickNext(pool, current) {
   const now = Date.now();
@@ -609,6 +864,112 @@ function wrapStream(response) {
   }
   return response;
 }
+async function runManagementMenu(db2, mgmt, promptFn) {
+  let running = true;
+  while (running) {
+    const accounts = mgmt.listAccountsWithHealth(db2);
+    console.log("\n=== Anthropic Account Management ===\n");
+    if (accounts.length === 0) {
+      console.log("  No accounts configured.\n");
+    } else {
+      accounts.forEach((a, i) => {
+        console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
+      });
+      console.log();
+    }
+    console.log("  [1] List accounts");
+    console.log("  [2] Remove account");
+    console.log("  [3] Reset account");
+    console.log("  [4] Pool config");
+    console.log("  [5] Exit");
+    console.log();
+    const choice = await promptFn("Choose action [1-5]: ");
+    switch (choice) {
+      case "1": {
+        const list = mgmt.listAccountsWithHealth(db2);
+        if (list.length === 0) {
+          console.log("\n  No accounts.\n");
+        } else {
+          console.log();
+          list.forEach((a, i) => {
+            console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
+            console.log(`      5h util: ${typeof a.util5h === "number" ? a.util5h.toFixed(2) : a.util5h} (${a.util5hRelative})`);
+            console.log(`      7d util: ${typeof a.util7d === "number" ? a.util7d.toFixed(2) : a.util7d} (${a.util7dRelative})`);
+          });
+          console.log();
+        }
+        break;
+      }
+      case "2": {
+        const list = mgmt.listAccountsWithHealth(db2);
+        if (list.length === 0) {
+          console.log("\n  No accounts to remove.\n");
+          break;
+        }
+        const num = await promptFn(`Account number to remove [1-${list.length}]: `);
+        const idx = parseInt(num, 10) - 1;
+        if (idx < 0 || idx >= list.length) {
+          console.log("  Invalid selection.");
+          break;
+        }
+        const target = list[idx];
+        const confirm = await promptFn(`Remove "${target.label}"? [y/N]: `);
+        if (confirm.toLowerCase() === "y") {
+          mgmt.removeAccount(target.id, db2);
+          console.log(`  Removed "${target.label}".`);
+        } else {
+          console.log("  Cancelled.");
+        }
+        break;
+      }
+      case "3": {
+        const list = mgmt.listAccountsWithHealth(db2);
+        if (list.length === 0) {
+          console.log("\n  No accounts to reset.\n");
+          break;
+        }
+        const num = await promptFn(`Account number to reset [1-${list.length}]: `);
+        const idx = parseInt(num, 10) - 1;
+        if (idx < 0 || idx >= list.length) {
+          console.log("  Invalid selection.");
+          break;
+        }
+        const target = list[idx];
+        const result = mgmt.resetAccount(target.id, db2);
+        console.log(`  Reset "${target.label}". Status: ${result.account.status ?? "active"}`);
+        break;
+      }
+      case "4": {
+        const cfg = mgmt.getConfig(db2);
+        console.log("\n  Pool Configuration:");
+        if (cfg.entries.length === 0) {
+          console.log("  No configuration entries.\n");
+        } else {
+          cfg.entries.forEach(({ key, value, description }) => {
+            console.log(`    ${key} = ${value} \u2014 ${description}`);
+          });
+          console.log();
+        }
+        const toggle = await promptFn("Toggle a config key (or press Enter to skip): ");
+        if (toggle) {
+          const current = cfg.values[toggle];
+          if (current === void 0) {
+            console.log(`  Unknown key: ${toggle}`);
+          } else {
+            const newValue = typeof current === "boolean" ? !current : current;
+            mgmt.setConfig(toggle, String(newValue), db2);
+            console.log(`  Set ${toggle} = ${newValue}`);
+          }
+        }
+        break;
+      }
+      case "5":
+      default:
+        running = false;
+        break;
+    }
+  }
+}
 async function AnthropicAuthPlugin({ client: _client }) {
   return {
     "experimental.chat.system.transform": (input, output) => {
@@ -625,7 +986,8 @@ async function AnthropicAuthPlugin({ client: _client }) {
         poolLog("loader called");
         const auth = await getAuth();
         let pool = loadPool();
-        if ((!pool || !pool.accounts.length) && auth && auth.type === "oauth" && auth.refresh) {
+        const poolInitialized = config("pool_initialized", false);
+        if ((!pool || !pool.accounts.length) && !poolInitialized && auth && auth.type === "oauth" && auth.refresh) {
           open().prepare(
             "INSERT OR IGNORE INTO account (id, label, refresh, access, expires, status, type) VALUES (?, ?, ?, ?, ?, 'active', 'oauth')"
           ).run(randomUUID(), "migrated", auth.refresh, auth.access || "", auth.expires || 0);
@@ -907,31 +1269,56 @@ async function AnthropicAuthPlugin({ client: _client }) {
           provider: "anthropic",
           label: "Manually enter API Key",
           type: "api"
+        },
+        {
+          label: "Manage accounts",
+          type: "oauth",
+          authorize: async () => {
+            const { createInterface } = await import("node:readline");
+            const mgmt = await Promise.resolve().then(() => (init_management(), management_exports));
+            const db2 = open();
+            const promptFn = (question) => new Promise((resolve) => {
+              const rl = createInterface({ input: process.stdin, output: process.stdout });
+              rl.question(question, (answer) => {
+                rl.close();
+                resolve(answer.trim());
+              });
+            });
+            await runManagementMenu(db2, mgmt, promptFn);
+            return {
+              url: "",
+              instructions: "",
+              method: "auto",
+              callback: async () => ({ type: "failed" })
+            };
+          }
         }
       ]
     }
   };
 }
-var __test = {
+var __test2 = {
   authHeaders,
   buildBillingHeader,
   buildRequest,
   describeRefreshFailure,
   pickNext,
   isAllOAuthExhausted,
+  persistAccountCredentials,
   loadPool,
   parseUtil,
   parseCooldown,
-  STALE_5H,
-  STALE_7D,
+  STALE_5H: STALE_5H3,
+  STALE_7D: STALE_7D3,
   STALE_OVERAGE,
   TRANSIENT_THRESHOLD,
   FALLBACK_COOLDOWN,
   MAX_RETRY_AFTER,
   MAX_COOLDOWN_FROM_RESET,
-  DEAD_AFTER_FAILURES
+  DEAD_AFTER_FAILURES,
+  runManagementMenu
 };
 export {
   AnthropicAuthPlugin,
-  __test
+  __test2 as __test
 };

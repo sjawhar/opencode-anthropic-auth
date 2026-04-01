@@ -1,7 +1,103 @@
-import { mock, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { existsSync } from "node:fs";
+import { mock, test, expect, describe, beforeEach, afterEach, afterAll } from "bun:test";
 
 const T = { db: null, refreshFn: null, fetchCalls: [] };
 const originalFetch = globalThis.fetch;
+const STALE_5H = 3_600_000;
+const STALE_7D = 43_200_000;
+
+function ensureConfigTable(db = T.db) {
+  db?.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+}
+
+function parseStoredValue(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+
+  const numeric = Number(value);
+  return Number.isNaN(numeric) ? value : numeric;
+}
+
+function listAccountsRows(dbInstance = T.db) {
+  const db = dbInstance || T.db;
+  return db.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures
+    FROM account
+  `).all();
+}
+
+function removeAccountRow(dbInstance = T.db, id) {
+  const db = dbInstance || T.db;
+  const result = db.prepare("DELETE FROM account WHERE id = ?").run(id);
+  const remaining = db.prepare("SELECT COUNT(*) as count FROM account").get();
+  return { deleted: result.changes === 1, remaining: remaining.count };
+}
+
+function resetAccountRow(dbInstance = T.db, id) {
+  const db = dbInstance || T.db;
+  const existing = db.prepare("SELECT id FROM account WHERE id = ?").get(id);
+  if (!existing) throw new Error(`Account not found: ${id}`);
+
+  db.prepare(`
+    UPDATE account
+    SET status = 'active', cooldown_until = 0, consecutive_failures = 0, refresh_lock = 0
+    WHERE id = ?
+  `).run(id);
+
+  return db.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures, refresh_lock
+    FROM account WHERE id = ?
+  `).get(id);
+}
+
+function getAccountHealthRow(dbInstance = T.db, id) {
+  const db = dbInstance || T.db;
+  const row = db.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures
+    FROM account WHERE id = ?
+  `).get(id);
+
+  if (!row) throw new Error(`Account not found: ${id}`);
+
+  const now = Date.now();
+  const isStale5h = now - row.util5h_at > STALE_5H;
+  const isStale7d = now - row.util7d_at > STALE_7D;
+  const isCoolingDown = row.cooldown_until > now;
+
+  return {
+    ...row,
+    isStale5h,
+    isStale7d,
+    isCoolingDown,
+    cooldownRemaining: isCoolingDown ? row.cooldown_until - now : 0,
+    isDead: row.status === "dead",
+  };
+}
+
+function setConfigRow(dbInstance = T.db, key, value) {
+  const db = dbInstance || T.db;
+  if (key !== "prefer_apikey_over_overage") {
+    throw new Error(`Unknown config key: ${key}`);
+  }
+
+  ensureConfigTable(db);
+  db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
+}
+
+function listConfigRows(dbInstance = T.db) {
+  const db = dbInstance || T.db;
+  ensureConfigTable(db);
+  return db.prepare("SELECT key, value FROM config").all();
+}
 
 mock.module("./db.mjs", () => ({
   open: () => T.db,
@@ -17,7 +113,18 @@ mock.module("./db.mjs", () => ({
   releaseRefreshLock: (id) => {
     T.db.prepare("UPDATE account SET refresh_lock = 0 WHERE id = ?").run(id);
   },
-  config: (_key, fb) => fb,
+  config: (key, fallback) => {
+    if (!T.db) return fallback;
+    ensureConfigTable(T.db);
+    const row = T.db.prepare("SELECT value FROM config WHERE key = ?").get(key);
+    return row ? parseStoredValue(row.value) : fallback;
+  },
+  listAccounts: (dbInstance) => listAccountsRows(dbInstance),
+  removeAccount: (dbInstance, id) => removeAccountRow(dbInstance, id),
+  resetAccount: (dbInstance, id) => resetAccountRow(dbInstance, id),
+  getAccountHealth: (dbInstance, id) => getAccountHealthRow(dbInstance, id),
+  setConfig: (dbInstance, key, value) => setConfigRow(dbInstance, key, value),
+  listConfig: (dbInstance) => listConfigRows(dbInstance),
 }));
 
 mock.module("../shared/oauth.mjs", () => ({
@@ -239,4 +346,214 @@ test("fence 6: util timestamps updated after every successful request", async ()
 
   expect(state.util5h).toBeCloseTo(0.4);
   expect(state.util7d).toBeCloseTo(0.3);
+});
+
+describe("account management fences", () => {
+  test("delete last account leaves an empty pool", async () => {
+    const { __test } = await import("./index.mjs");
+    const management = await import("./management.mjs");
+    const db = await import("./db.mjs");
+
+    seedAccounts(T.db, [{ id: "solo", label: "Solo", refresh: "r-solo" }]);
+
+    expect(management.removeAccount("solo", T.db)).toEqual({ deleted: true, remaining: 0 });
+    expect(db.listAccounts(T.db)).toEqual([]);
+    expect(() => __test.loadPool()).not.toThrow();
+    expect(__test.loadPool()).toBeNull();
+  });
+
+  test("delete active account keeps the remaining account usable", async () => {
+    const now = Date.now();
+    const { AnthropicAuthPlugin, __test } = await import("./index.mjs");
+    const management = await import("./management.mjs");
+
+    seedAccounts(T.db, [
+      { id: "oauth-primary", label: "Primary", refresh: "r1", access: "a1", expires: now + 60_000, util5h: 0.1, util5h_at: now, util7d: 0.1, util7d_at: now },
+      { id: "oauth-backup", label: "Backup", refresh: "r2", access: "a2", expires: now + 60_000, util5h: 0.8, util5h_at: now, util7d: 0.8, util7d_at: now },
+    ]);
+
+    const dummy = { util5h: Infinity, util7d: Infinity, overage: true, cooloffUntil: Infinity, type: "apikey" };
+    const picked = __test.pickNext(__test.loadPool(), dummy);
+    const survivorId = picked.id === "oauth-primary" ? "oauth-backup" : "oauth-primary";
+    const survivorAccess = survivorId === "oauth-backup" ? "a2" : "a1";
+
+    expect(management.removeAccount(picked.id, T.db)).toEqual({ deleted: true, remaining: 1 });
+
+    const plugin = await AnthropicAuthPlugin({ client: {} });
+    const loader = await plugin.auth.loader(async () => null, { models: {} });
+
+    globalThis.fetch = async (url, req = {}) => {
+      const headers = Object.fromEntries(req.headers?.entries?.() ?? []);
+      T.fetchCalls.push({ url, headers });
+      return authResponse(200, {});
+    };
+
+    await loader.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {},
+      body: makeRequestBody(),
+    });
+
+    expect(__test.loadPool().accounts.map((account) => account.id)).toEqual([survivorId]);
+    expect(T.fetchCalls).toHaveLength(1);
+    expect(T.fetchCalls[0].headers.authorization).toBe(`Bearer ${survivorAccess}`);
+  });
+
+  test("auth-store OAuth credentials are not resurrected after the pool was initialized", async () => {
+    const now = Date.now();
+    const { AnthropicAuthPlugin, __test } = await import("./index.mjs");
+    const management = await import("./management.mjs");
+
+    const persistedId = __test.persistAccountCredentials(
+      T.db,
+      "Migrated Once",
+      {
+        account: { uuid: "oauth-seeded" },
+        refresh_token: "refresh-seeded",
+        access_token: "access-seeded",
+        expires_in: 60,
+      },
+      now,
+      "oauth",
+    );
+
+    expect(management.removeAccount(persistedId, T.db)).toEqual({ deleted: true, remaining: 0 });
+
+    const plugin = await AnthropicAuthPlugin({ client: {} });
+    const provider = { models: {} };
+    const loader = await plugin.auth.loader(
+      async () => ({ type: "oauth", refresh: "auth-refresh", access: "auth-access", expires: now + 60_000 }),
+      provider,
+    );
+
+    expect(loader).toEqual({});
+    expect(__test.loadPool()).toBeNull();
+    expect(T.db.prepare("SELECT COUNT(*) AS count FROM account").get().count).toBe(0);
+  });
+
+  test("duplicate labels delete by id only", async () => {
+    const management = await import("./management.mjs");
+    const db = await import("./db.mjs");
+
+    seedAccounts(T.db, [
+      { id: "dup-a", label: "test", refresh: "ra" },
+      { id: "dup-b", label: "test", refresh: "rb" },
+    ]);
+
+    expect(management.removeAccount("dup-a", T.db)).toEqual({ deleted: true, remaining: 1 });
+    expect(db.listAccounts(T.db)).toEqual([
+      {
+        id: "dup-b",
+        label: "test",
+        type: "oauth",
+        status: "active",
+        cooldown_until: 0,
+        expires: 0,
+        util5h: 0,
+        util5h_at: 0,
+        util7d: 0,
+        util7d_at: 0,
+        overage: 0,
+        overage_at: 0,
+        consecutive_failures: 0,
+      },
+    ]);
+  });
+
+  test("reset preserves OAuth credentials while clearing operational state", async () => {
+    const now = Date.now();
+    const management = await import("./management.mjs");
+
+    seedAccounts(T.db, [
+      {
+        id: "oauth-reset",
+        label: "OAuth Reset",
+        refresh: "refresh-known",
+        access: "access-known",
+        expires: now + 120_000,
+        util5h: 0.4,
+        util5h_at: now,
+        util7d: 0.2,
+        util7d_at: now,
+        overage: 1,
+        overage_at: now,
+        status: "dead",
+        cooldown_until: now + 30_000,
+        refresh_lock: now,
+        consecutive_failures: 3,
+        type: "oauth",
+      },
+    ]);
+
+    management.resetAccount("oauth-reset", T.db);
+
+    const row = T.db.prepare("SELECT * FROM account WHERE id = ?").get("oauth-reset");
+    expect(row.refresh).toBe("refresh-known");
+    expect(row.access).toBe("access-known");
+    expect(row.type).toBe("oauth");
+    expect(row.expires).toBe(now + 120_000);
+    expect(row.util5h).toBe(0.4);
+    expect(row.util7d).toBe(0.2);
+    expect(row.status).toBe("active");
+    expect(row.cooldown_until).toBe(0);
+    expect(row.consecutive_failures).toBe(0);
+    expect(row.refresh_lock).toBe(0);
+  });
+
+  test("config round-trips through db.config parsing", async () => {
+    const management = await import("./management.mjs");
+    const db = await import("./db.mjs");
+
+    management.setConfig("prefer_apikey_over_overage", "true", T.db);
+
+    expect(db.config("prefer_apikey_over_overage", false)).toBe(true);
+  });
+
+  test("existing auth method labels remain unchanged", async () => {
+    const { AnthropicAuthPlugin } = await import("./index.mjs");
+
+    const plugin = await AnthropicAuthPlugin({ client: {} });
+    const labels = plugin.auth.methods.map((method) => method.label);
+
+    expect(labels[0]).toBe("Claude Pro/Max");
+    expect(labels[1]).toBe("Create an API Key");
+    expect(labels[2]).toBe("Manually enter API Key");
+    expect(labels[3]).toBe("Manage accounts");
+  });
+
+  test("API key accounts keep their type after reset", async () => {
+    const now = Date.now();
+    const management = await import("./management.mjs");
+
+    seedAccounts(T.db, [
+      {
+        id: "apikey-reset",
+        label: "Key Reset",
+        refresh: "",
+        access: "sk-ant-api03-preserve",
+        status: "dead",
+        cooldown_until: now + 45_000,
+        refresh_lock: now,
+        consecutive_failures: 2,
+        type: "apikey",
+      },
+    ]);
+
+    management.resetAccount("apikey-reset", T.db);
+
+    const row = T.db.prepare("SELECT type, access, refresh FROM account WHERE id = ?").get("apikey-reset");
+    expect(row.type).toBe("apikey");
+    expect(row.access).toBe("sk-ant-api03-preserve");
+    expect(row.refresh).toBe("");
+  });
+
+  test("build verification fences require both bundles", () => {
+    expect(existsSync(new URL("./dist/index.mjs", import.meta.url))).toBe(true);
+    expect(existsSync(new URL("./dist/tui.mjs", import.meta.url))).toBe(true);
+  });
+
+  test("standalone add-account scripts stay deleted", () => {
+    expect(existsSync(new URL("./add-account.mjs", import.meta.url))).toBe(false);
+    expect(existsSync(new URL("./add-account-lib.mjs", import.meta.url))).toBe(false);
+  });
 });

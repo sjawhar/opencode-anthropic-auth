@@ -105,6 +105,44 @@ function setCooldown(id, until) {
   );
 }
 
+function persistAccountCredentials(db, label, credentials, now = Date.now(), type = "oauth") {
+  let id;
+  let access;
+  let refresh;
+  let expires;
+
+  if (type === "apikey") {
+    id = randomUUID();
+    access = credentials.apiKey;
+    refresh = "";
+    expires = 0;
+  } else {
+    id = credentials.account?.uuid;
+    if (!id) {
+      throw new Error("Authorization succeeded but account UUID is missing.");
+    }
+    access = credentials.access_token || "";
+    refresh = credentials.refresh_token;
+    expires = credentials.expires_in ? now + credentials.expires_in * 1000 : 0;
+  }
+
+  db.prepare(
+    "INSERT OR REPLACE INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?)",
+  ).run(
+    id,
+    label.trim() || "unnamed",
+    refresh,
+    access,
+    expires,
+    type,
+  );
+
+  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
+  db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+
+  return id;
+}
+
 // --- Account selection ---
 
 function pickNext(pool, current) {
@@ -544,6 +582,122 @@ function wrapStream(response) {
   return response;
 }
 
+// --- Management menu (interactive, runs inside authorize()) ---
+
+async function runManagementMenu(db, mgmt, promptFn) {
+  let running = true;
+  while (running) {
+    const accounts = mgmt.listAccountsWithHealth(db);
+
+    console.log("\n=== Anthropic Account Management ===\n");
+    if (accounts.length === 0) {
+      console.log("  No accounts configured.\n");
+    } else {
+      accounts.forEach((a, i) => {
+        console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
+      });
+      console.log();
+    }
+
+    console.log("  [1] List accounts");
+    console.log("  [2] Remove account");
+    console.log("  [3] Reset account");
+    console.log("  [4] Pool config");
+    console.log("  [5] Exit");
+    console.log();
+
+    const choice = await promptFn("Choose action [1-5]: ");
+
+    switch (choice) {
+      case "1": {
+        const list = mgmt.listAccountsWithHealth(db);
+        if (list.length === 0) {
+          console.log("\n  No accounts.\n");
+        } else {
+          console.log();
+          list.forEach((a, i) => {
+            console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
+            console.log(`      5h util: ${typeof a.util5h === "number" ? a.util5h.toFixed(2) : a.util5h} (${a.util5hRelative})`);
+            console.log(`      7d util: ${typeof a.util7d === "number" ? a.util7d.toFixed(2) : a.util7d} (${a.util7dRelative})`);
+          });
+          console.log();
+        }
+        break;
+      }
+
+      case "2": {
+        const list = mgmt.listAccountsWithHealth(db);
+        if (list.length === 0) {
+          console.log("\n  No accounts to remove.\n");
+          break;
+        }
+        const num = await promptFn(`Account number to remove [1-${list.length}]: `);
+        const idx = parseInt(num, 10) - 1;
+        if (idx < 0 || idx >= list.length) {
+          console.log("  Invalid selection.");
+          break;
+        }
+        const target = list[idx];
+        const confirm = await promptFn(`Remove "${target.label}"? [y/N]: `);
+        if (confirm.toLowerCase() === "y") {
+          mgmt.removeAccount(target.id, db);
+          console.log(`  Removed "${target.label}".`);
+        } else {
+          console.log("  Cancelled.");
+        }
+        break;
+      }
+
+      case "3": {
+        const list = mgmt.listAccountsWithHealth(db);
+        if (list.length === 0) {
+          console.log("\n  No accounts to reset.\n");
+          break;
+        }
+        const num = await promptFn(`Account number to reset [1-${list.length}]: `);
+        const idx = parseInt(num, 10) - 1;
+        if (idx < 0 || idx >= list.length) {
+          console.log("  Invalid selection.");
+          break;
+        }
+        const target = list[idx];
+        const result = mgmt.resetAccount(target.id, db);
+        console.log(`  Reset "${target.label}". Status: ${result.account.status ?? "active"}`);
+        break;
+      }
+
+      case "4": {
+        const cfg = mgmt.getConfig(db);
+        console.log("\n  Pool Configuration:");
+        if (cfg.entries.length === 0) {
+          console.log("  No configuration entries.\n");
+        } else {
+          cfg.entries.forEach(({ key, value, description }) => {
+            console.log(`    ${key} = ${value} — ${description}`);
+          });
+          console.log();
+        }
+        const toggle = await promptFn("Toggle a config key (or press Enter to skip): ");
+        if (toggle) {
+          const current = cfg.values[toggle];
+          if (current === undefined) {
+            console.log(`  Unknown key: ${toggle}`);
+          } else {
+            const newValue = typeof current === "boolean" ? !current : current;
+            mgmt.setConfig(toggle, String(newValue), db);
+            console.log(`  Set ${toggle} = ${newValue}`);
+          }
+        }
+        break;
+      }
+
+      case "5":
+      default:
+        running = false;
+        break;
+    }
+  }
+}
 // --- Plugin export ---
 
 export async function AnthropicAuthPlugin({ client: _client }) {
@@ -565,7 +719,8 @@ export async function AnthropicAuthPlugin({ client: _client }) {
         const auth = await getAuth();
         let pool = loadPool();
 
-        if ((!pool || !pool.accounts.length) && auth && auth.type === "oauth" && auth.refresh) {
+        const poolInitialized = config("pool_initialized", false);
+        if ((!pool || !pool.accounts.length) && !poolInitialized && auth && auth.type === "oauth" && auth.refresh) {
           open()
             .prepare(
               "INSERT OR IGNORE INTO account (id, label, refresh, access, expires, status, type) VALUES (?, ?, ?, ?, ?, 'active', 'oauth')",
@@ -881,6 +1036,33 @@ export async function AnthropicAuthPlugin({ client: _client }) {
           label: "Manually enter API Key",
           type: "api",
         },
+        {
+          label: "Manage accounts",
+          type: "oauth",
+          authorize: async () => {
+            const { createInterface } = await import("node:readline");
+            const mgmt = await import("./management.mjs");
+            const db = open();
+
+            const promptFn = (question) =>
+              new Promise((resolve) => {
+                const rl = createInterface({ input: process.stdin, output: process.stdout });
+                rl.question(question, (answer) => {
+                  rl.close();
+                  resolve(answer.trim());
+                });
+              });
+
+            await runManagementMenu(db, mgmt, promptFn);
+
+            return {
+              url: "",
+              instructions: "",
+              method: "auto",
+              callback: async () => ({ type: "failed" }),
+            };
+          },
+        },
       ],
     },
   };
@@ -888,8 +1070,9 @@ export async function AnthropicAuthPlugin({ client: _client }) {
 
 export const __test = {
   authHeaders, buildBillingHeader, buildRequest, describeRefreshFailure,
-  pickNext, isAllOAuthExhausted,
+  pickNext, isAllOAuthExhausted, persistAccountCredentials,
   loadPool, parseUtil, parseCooldown,
   STALE_5H, STALE_7D, STALE_OVERAGE, TRANSIENT_THRESHOLD,
   FALLBACK_COOLDOWN, MAX_RETRY_AFTER, MAX_COOLDOWN_FROM_RESET, DEAD_AFTER_FAILURES,
+  runManagementMenu,
 };
