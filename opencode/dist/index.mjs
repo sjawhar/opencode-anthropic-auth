@@ -37,6 +37,7 @@ function open() {
       cooldown_until INTEGER NOT NULL DEFAULT 0
     )
   `);
+  db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   try {
     db.exec("ALTER TABLE account ADD COLUMN refresh_lock INTEGER NOT NULL DEFAULT 0");
   } catch {
@@ -65,10 +66,6 @@ function releaseRefreshLock(id) {
 }
 function config(key, fallback) {
   const db2 = open();
-  try {
-    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  } catch {
-  }
   const row = db2.prepare("SELECT value FROM config WHERE key = ?").get(key);
   if (!row) return fallback;
   if (row.value === "true") return true;
@@ -114,49 +111,16 @@ function resetAccount(dbInstance, id) {
   `).get(id);
   return updated;
 }
-function getAccountHealth(dbInstance, id) {
-  const db2 = dbInstance || open();
-  const row = db2.prepare(`
-    SELECT
-      id, label, type, status, cooldown_until, expires,
-      util5h, util5h_at, util7d, util7d_at,
-      overage, overage_at, consecutive_failures
-    FROM account WHERE id = ?
-  `).get(id);
-  if (!row) throw new Error(`Account not found: ${id}`);
-  const now = Date.now();
-  const isStale5h = now - row.util5h_at > STALE_5H;
-  const isStale7d = now - row.util7d_at > STALE_7D;
-  const isCoolingDown = row.cooldown_until > now;
-  const cooldownRemaining = isCoolingDown ? row.cooldown_until - now : 0;
-  const isDead = row.status === "dead";
-  return {
-    ...row,
-    isStale5h,
-    isStale7d,
-    isCoolingDown,
-    cooldownRemaining,
-    isDead
-  };
-}
 function setConfig(dbInstance, key, value) {
   const allowlist = ["prefer_apikey_over_overage"];
   if (!allowlist.includes(key)) {
     throw new Error(`Unknown config key: ${key}`);
   }
   const db2 = dbInstance || open();
-  try {
-    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  } catch {
-  }
   db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
 }
 function listConfig(dbInstance) {
   const db2 = dbInstance || open();
-  try {
-    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  } catch {
-  }
   return db2.prepare("SELECT key, value FROM config").all();
 }
 var DB_PATH, db, LOCK_TIMEOUT, STALE_5H, STALE_7D;
@@ -211,32 +175,39 @@ function formatAccountStatus(account) {
     return `[cooling down: ${formatDuration(account.cooldown_until - now)}]`;
   }
   if (account.status === "active" && account.consecutive_failures > 0) {
-    return "[rate-limited]";
+    return "[auth-failing]";
   }
   if (account.status === "active") return "[active]";
   return `[${account.status ?? "unknown"}]`;
 }
 function redactAccount(account) {
   const redacted = { ...account };
-  const maskedAccess = redacted.type === "apikey" && redacted.access ? `sk-ant-...${String(redacted.access).slice(-4)}` : void 0;
+  if (redacted.type === "apikey" && redacted.access) {
+    redacted.maskedAccess = `sk-ant-...${String(redacted.access).slice(-4)}`;
+  }
   delete redacted.refresh;
   delete redacted.access;
-  if (maskedAccess) redacted.maskedAccess = maskedAccess;
   return redacted;
 }
 function listAccountsWithHealth(dbInstance) {
+  const now = Date.now();
   return listAccounts(dbInstance).map((account) => {
-    const health = getAccountHealth(dbInstance, account.id);
+    const isStale5h = now - account.util5h_at > STALE_5H;
+    const isStale7d = now - account.util7d_at > STALE_7D;
+    const isCoolingDown = account.cooldown_until > now;
+    const cooldownRemaining = isCoolingDown ? account.cooldown_until - now : 0;
+    const isDead = account.status === "dead";
+    const healthObj = { ...account, isStale5h, isStale7d, isCoolingDown, cooldownRemaining, isDead };
     const decorated = {
       ...account,
-      isStale5h: health.isStale5h,
-      isStale7d: health.isStale7d,
-      isCoolingDown: health.isCoolingDown,
-      cooldownRemaining: health.cooldownRemaining,
-      isDead: health.isDead,
-      util5h: health.isStale5h ? 0 : account.util5h,
-      util7d: health.isStale7d ? 0 : account.util7d,
-      statusBadge: formatAccountStatus(health),
+      isStale5h,
+      isStale7d,
+      isCoolingDown,
+      cooldownRemaining,
+      isDead,
+      util5h: isStale5h ? 0 : account.util5h,
+      util7d: isStale7d ? 0 : account.util7d,
+      statusBadge: formatAccountStatus(healthObj),
       util5hRelative: formatRelativeTime(account.util5h_at),
       util7dRelative: formatRelativeTime(account.util7d_at),
       overageRelative: formatRelativeTime(account.overage_at)
@@ -245,21 +216,35 @@ function listAccountsWithHealth(dbInstance) {
   });
 }
 function removeAccount2(id, dbInstance) {
-  return removeAccount(dbInstance, id);
+  const result = removeAccount(dbInstance, id);
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+  return result;
 }
 function resetAccount2(id, dbInstance) {
   const account = resetAccount(dbInstance, id);
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
   return {
     reset: true,
     account: redactAccount(account)
   };
 }
 function getConfig(dbInstance) {
-  const entries = listConfig(dbInstance).map(({ key, value }) => ({
-    key,
-    value: parseConfigValue(value),
-    description: CONFIG_DESCRIPTIONS[key] ?? key
-  }));
+  const rawEntries = listConfig(dbInstance);
+  const userEntries = rawEntries.filter(({ key }) => !INTERNAL_KEYS.has(key));
+  let entries;
+  if (userEntries.length > 0) {
+    entries = userEntries.map(({ key, value }) => ({
+      key,
+      value: parseConfigValue(value),
+      description: CONFIG_DESCRIPTIONS[key] ?? key
+    }));
+  } else {
+    entries = Object.entries(CONFIG_DESCRIPTIONS).map(([key, description]) => ({
+      key,
+      value: false,
+      description
+    }));
+  }
   return {
     values: Object.fromEntries(entries.map(({ key, value }) => [key, value])),
     entries
@@ -269,19 +254,18 @@ function setConfig2(key, value, dbInstance) {
   setConfig(dbInstance, key, value);
   return getConfig(dbInstance);
 }
-var STALE_5H2, STALE_7D2, CONFIG_DESCRIPTIONS, __test;
+var CONFIG_DESCRIPTIONS, INTERNAL_KEYS, __test;
 var init_management = __esm({
   "management.mjs"() {
     init_db();
-    STALE_5H2 = 36e5;
-    STALE_7D2 = 432e5;
     CONFIG_DESCRIPTIONS = {
       prefer_apikey_over_overage: "Prefer API key accounts over OAuth accounts currently using overage."
     };
+    INTERNAL_KEYS = /* @__PURE__ */ new Set(["pool_initialized"]);
     __test = {
       CONFIG_DESCRIPTIONS,
-      STALE_5H: STALE_5H2,
-      STALE_7D: STALE_7D2,
+      STALE_5H,
+      STALE_7D,
       formatDuration,
       parseConfigValue
     };
@@ -409,8 +393,6 @@ function poolLog(msg) {
   } catch {
   }
 }
-var STALE_5H3 = 36e5;
-var STALE_7D3 = 432e5;
 var STALE_OVERAGE = 18e5;
 var TRANSIENT_THRESHOLD = 1e4;
 var CLOCK_SKEW_BUFFER = 2e3;
@@ -429,8 +411,8 @@ function loadPool() {
       refresh: r.refresh,
       access: r.access || "",
       expires: r.expires || 0,
-      util5h: now - r.util5h_at < STALE_5H3 ? r.util5h : 0,
-      util7d: now - r.util7d_at < STALE_7D3 ? r.util7d : 0,
+      util5h: now - r.util5h_at < STALE_5H ? r.util5h : 0,
+      util7d: now - r.util7d_at < STALE_7D ? r.util7d : 0,
       cooloffUntil: r.cooldown_until || 0,
       overage: now - r.overage_at < STALE_OVERAGE ? !!r.overage : false,
       overageAt: r.overage_at || 0,
@@ -498,7 +480,7 @@ function persistAccountCredentials(db2, label, credentials, now = Date.now(), ty
     expires = credentials.expires_in ? now + credentials.expires_in * 1e3 : 0;
   }
   db2.prepare(
-    "INSERT OR REPLACE INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?)"
+    "INSERT INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?) ON CONFLICT(id) DO UPDATE SET refresh=excluded.refresh, access=excluded.access, expires=excluded.expires, status='active', consecutive_failures=0"
   ).run(
     id,
     label.trim() || "unnamed",
@@ -507,12 +489,51 @@ function persistAccountCredentials(db2, label, credentials, now = Date.now(), ty
     expires,
     type
   );
-  try {
-    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  } catch {
-  }
   db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
   return id;
+}
+function normalizePersistableOAuthCredentials(credentials, now = Date.now()) {
+  if (credentials.account?.uuid) return credentials;
+  return {
+    account: { uuid: randomUUID() },
+    refresh_token: credentials.refresh,
+    access_token: credentials.access || "",
+    expires_in: credentials.expires ? Math.max(0, Math.ceil((credentials.expires - now) / 1e3)) : 0
+  };
+}
+function createClaudeProMaxCallback(verifier, deps = {}) {
+  const exchangeFn = deps.exchange ?? exchange;
+  const openDb = deps.open ?? open;
+  const persist = deps.persistAccountCredentials ?? persistAccountCredentials;
+  return async (code) => {
+    const credentials = await exchangeFn(code, verifier);
+    if (credentials.type !== "failed") {
+      persist(openDb(), "Claude Pro/Max", normalizePersistableOAuthCredentials(credentials));
+    }
+    return credentials;
+  };
+}
+function createApiKeyCallback(verifier, deps = {}) {
+  const exchangeFn = deps.exchange ?? exchange;
+  const fetchFn = deps.fetch ?? fetch;
+  const openDb = deps.open ?? open;
+  const persist = deps.persistAccountCredentials ?? persistAccountCredentials;
+  const now = deps.now ?? (() => Date.now());
+  return async (code) => {
+    const credentials = await exchangeFn(code, verifier);
+    if (credentials.type === "failed") return credentials;
+    const result = await fetchFn(
+      `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
+      {
+        method: "POST",
+        headers: authHeaders({
+          authorization: `Bearer ${credentials.access}`
+        })
+      }
+    ).then((r) => r.json());
+    persist(openDb(), "API Key", { apiKey: result.raw_key }, now(), "apikey");
+    return { type: "success", key: result.raw_key };
+  };
 }
 function pickNext(pool, current) {
   const now = Date.now();
@@ -957,8 +978,12 @@ async function runManagementMenu(db2, mgmt, promptFn) {
             console.log(`  Unknown key: ${toggle}`);
           } else {
             const newValue = typeof current === "boolean" ? !current : current;
-            mgmt.setConfig(toggle, String(newValue), db2);
-            console.log(`  Set ${toggle} = ${newValue}`);
+            try {
+              mgmt.setConfig(toggle, String(newValue), db2);
+              console.log(`  Set ${toggle} = ${newValue}`);
+            } catch (err) {
+              console.log(`  Error: ${err.message}`);
+            }
           }
         }
         break;
@@ -1235,7 +1260,7 @@ async function AnthropicAuthPlugin({ client: _client }) {
               url,
               instructions: "Paste the authorization code here: ",
               method: "code",
-              callback: async (code) => exchange(code, verifier)
+              callback: createClaudeProMaxCallback(verifier)
             };
           }
         },
@@ -1248,20 +1273,7 @@ async function AnthropicAuthPlugin({ client: _client }) {
               url,
               instructions: "Paste the authorization code here: ",
               method: "code",
-              callback: async (code) => {
-                const credentials = await exchange(code, verifier);
-                if (credentials.type === "failed") return credentials;
-                const result = await fetch(
-                  `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
-                  {
-                    method: "POST",
-                    headers: authHeaders({
-                      authorization: `Bearer ${credentials.access}`
-                    })
-                  }
-                ).then((r) => r.json());
-                return { type: "success", key: result.raw_key };
-              }
+              callback: createApiKeyCallback(verifier)
             };
           }
         },
@@ -1305,11 +1317,13 @@ var __test2 = {
   pickNext,
   isAllOAuthExhausted,
   persistAccountCredentials,
+  createClaudeProMaxCallback,
+  createApiKeyCallback,
   loadPool,
   parseUtil,
   parseCooldown,
-  STALE_5H: STALE_5H3,
-  STALE_7D: STALE_7D3,
+  STALE_5H,
+  STALE_7D,
   STALE_OVERAGE,
   TRANSIENT_THRESHOLD,
   FALLBACK_COOLDOWN,

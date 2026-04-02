@@ -32,6 +32,7 @@ function open() {
       cooldown_until INTEGER NOT NULL DEFAULT 0
     )
   `);
+  db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   try {
     db.exec("ALTER TABLE account ADD COLUMN refresh_lock INTEGER NOT NULL DEFAULT 0");
   } catch {
@@ -86,49 +87,16 @@ function resetAccount(dbInstance, id) {
   `).get(id);
   return updated;
 }
-function getAccountHealth(dbInstance, id) {
-  const db2 = dbInstance || open();
-  const row = db2.prepare(`
-    SELECT
-      id, label, type, status, cooldown_until, expires,
-      util5h, util5h_at, util7d, util7d_at,
-      overage, overage_at, consecutive_failures
-    FROM account WHERE id = ?
-  `).get(id);
-  if (!row) throw new Error(`Account not found: ${id}`);
-  const now = Date.now();
-  const isStale5h = now - row.util5h_at > STALE_5H;
-  const isStale7d = now - row.util7d_at > STALE_7D;
-  const isCoolingDown = row.cooldown_until > now;
-  const cooldownRemaining = isCoolingDown ? row.cooldown_until - now : 0;
-  const isDead = row.status === "dead";
-  return {
-    ...row,
-    isStale5h,
-    isStale7d,
-    isCoolingDown,
-    cooldownRemaining,
-    isDead
-  };
-}
 function setConfig(dbInstance, key, value) {
   const allowlist = ["prefer_apikey_over_overage"];
   if (!allowlist.includes(key)) {
     throw new Error(`Unknown config key: ${key}`);
   }
   const db2 = dbInstance || open();
-  try {
-    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  } catch {
-  }
   db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
 }
 function listConfig(dbInstance) {
   const db2 = dbInstance || open();
-  try {
-    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  } catch {
-  }
   return db2.prepare("SELECT key, value FROM config").all();
 }
 
@@ -136,6 +104,7 @@ function listConfig(dbInstance) {
 var CONFIG_DESCRIPTIONS = {
   prefer_apikey_over_overage: "Prefer API key accounts over OAuth accounts currently using overage."
 };
+var INTERNAL_KEYS = /* @__PURE__ */ new Set(["pool_initialized"]);
 function formatDuration(durationMs) {
   const totalSeconds = Math.max(0, Math.ceil(durationMs / 1e3));
   const minutes = Math.floor(totalSeconds / 60);
@@ -165,32 +134,39 @@ function formatAccountStatus(account) {
     return `[cooling down: ${formatDuration(account.cooldown_until - now)}]`;
   }
   if (account.status === "active" && account.consecutive_failures > 0) {
-    return "[rate-limited]";
+    return "[auth-failing]";
   }
   if (account.status === "active") return "[active]";
   return `[${account.status ?? "unknown"}]`;
 }
 function redactAccount(account) {
   const redacted = { ...account };
-  const maskedAccess = redacted.type === "apikey" && redacted.access ? `sk-ant-...${String(redacted.access).slice(-4)}` : void 0;
+  if (redacted.type === "apikey" && redacted.access) {
+    redacted.maskedAccess = `sk-ant-...${String(redacted.access).slice(-4)}`;
+  }
   delete redacted.refresh;
   delete redacted.access;
-  if (maskedAccess) redacted.maskedAccess = maskedAccess;
   return redacted;
 }
 function listAccountsWithHealth(dbInstance) {
+  const now = Date.now();
   return listAccounts(dbInstance).map((account) => {
-    const health = getAccountHealth(dbInstance, account.id);
+    const isStale5h = now - account.util5h_at > STALE_5H;
+    const isStale7d = now - account.util7d_at > STALE_7D;
+    const isCoolingDown = account.cooldown_until > now;
+    const cooldownRemaining = isCoolingDown ? account.cooldown_until - now : 0;
+    const isDead = account.status === "dead";
+    const healthObj = { ...account, isStale5h, isStale7d, isCoolingDown, cooldownRemaining, isDead };
     const decorated = {
       ...account,
-      isStale5h: health.isStale5h,
-      isStale7d: health.isStale7d,
-      isCoolingDown: health.isCoolingDown,
-      cooldownRemaining: health.cooldownRemaining,
-      isDead: health.isDead,
-      util5h: health.isStale5h ? 0 : account.util5h,
-      util7d: health.isStale7d ? 0 : account.util7d,
-      statusBadge: formatAccountStatus(health),
+      isStale5h,
+      isStale7d,
+      isCoolingDown,
+      cooldownRemaining,
+      isDead,
+      util5h: isStale5h ? 0 : account.util5h,
+      util7d: isStale7d ? 0 : account.util7d,
+      statusBadge: formatAccountStatus(healthObj),
       util5hRelative: formatRelativeTime(account.util5h_at),
       util7dRelative: formatRelativeTime(account.util7d_at),
       overageRelative: formatRelativeTime(account.overage_at)
@@ -199,21 +175,35 @@ function listAccountsWithHealth(dbInstance) {
   });
 }
 function removeAccount2(id, dbInstance) {
-  return removeAccount(dbInstance, id);
+  const result = removeAccount(dbInstance, id);
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+  return result;
 }
 function resetAccount2(id, dbInstance) {
   const account = resetAccount(dbInstance, id);
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
   return {
     reset: true,
     account: redactAccount(account)
   };
 }
 function getConfig(dbInstance) {
-  const entries = listConfig(dbInstance).map(({ key, value }) => ({
-    key,
-    value: parseConfigValue(value),
-    description: CONFIG_DESCRIPTIONS[key] ?? key
-  }));
+  const rawEntries = listConfig(dbInstance);
+  const userEntries = rawEntries.filter(({ key }) => !INTERNAL_KEYS.has(key));
+  let entries;
+  if (userEntries.length > 0) {
+    entries = userEntries.map(({ key, value }) => ({
+      key,
+      value: parseConfigValue(value),
+      description: CONFIG_DESCRIPTIONS[key] ?? key
+    }));
+  } else {
+    entries = Object.entries(CONFIG_DESCRIPTIONS).map(([key, description]) => ({
+      key,
+      value: false,
+      description
+    }));
+  }
   return {
     values: Object.fromEntries(entries.map(({ key, value }) => [key, value])),
     entries
