@@ -201,6 +201,28 @@ describe("management module", () => {
     ]);
   });
 
+  test("listAccountsWithHealth makes exactly 1 DB query (no N+1)", () => {
+    seedAccounts(db, [
+      { id: "a1", label: "A1", refresh: "r1", status: "active" },
+      { id: "a2", label: "A2", refresh: "r2", status: "active" },
+      { id: "a3", label: "A3", refresh: "r3", status: "active" },
+    ]);
+
+    let queryCount = 0;
+    const origPrepare = db.prepare.bind(db);
+    db.prepare = (...args) => {
+      queryCount++;
+      return origPrepare(...args);
+    };
+
+    const result = listAccountsWithHealth(db);
+    expect(result).toHaveLength(3);
+
+    // Before fix: 4 (1 listAccounts + 3 getAccountHealth)
+    // After fix: 1 (just listAccounts)
+    expect(queryCount).toBe(1);
+  });
+
   test("removeAccount returns deletion result and remaining count", () => {
     seedAccounts(db, [
       { id: "acc_1", label: "One", refresh: "r1" },

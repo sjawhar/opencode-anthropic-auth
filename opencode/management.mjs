@@ -1,5 +1,4 @@
 import {
-  getAccountHealth,
   listAccounts,
   listConfig,
   removeAccount as dbRemoveAccount,
@@ -76,18 +75,26 @@ export function redactAccount(account) {
 }
 
 export function listAccountsWithHealth(dbInstance) {
+  const now = Date.now();
   return listAccounts(dbInstance).map((account) => {
-    const health = getAccountHealth(dbInstance, account.id);
+    const isStale5h = now - account.util5h_at > STALE_5H;
+    const isStale7d = now - account.util7d_at > STALE_7D;
+    const isCoolingDown = account.cooldown_until > now;
+    const cooldownRemaining = isCoolingDown ? account.cooldown_until - now : 0;
+    const isDead = account.status === "dead";
+
+    const healthObj = { ...account, isStale5h, isStale7d, isCoolingDown, cooldownRemaining, isDead };
+
     const decorated = {
       ...account,
-      isStale5h: health.isStale5h,
-      isStale7d: health.isStale7d,
-      isCoolingDown: health.isCoolingDown,
-      cooldownRemaining: health.cooldownRemaining,
-      isDead: health.isDead,
-      util5h: health.isStale5h ? 0 : account.util5h,
-      util7d: health.isStale7d ? 0 : account.util7d,
-      statusBadge: formatAccountStatus(health),
+      isStale5h,
+      isStale7d,
+      isCoolingDown,
+      cooldownRemaining,
+      isDead,
+      util5h: isStale5h ? 0 : account.util5h,
+      util7d: isStale7d ? 0 : account.util7d,
+      statusBadge: formatAccountStatus(healthObj),
       util5hRelative: formatRelativeTime(account.util5h_at),
       util7dRelative: formatRelativeTime(account.util7d_at),
       overageRelative: formatRelativeTime(account.overage_at),
