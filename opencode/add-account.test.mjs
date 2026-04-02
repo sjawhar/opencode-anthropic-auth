@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { __test } from "./index.mjs";
+import { AnthropicAuthPlugin } from "./index.mjs";
+const __test = AnthropicAuthPlugin.__test;
 import { createTestDb, seedAccounts } from "./test-harness.mjs";
 const { persistAccountCredentials } = __test;
 

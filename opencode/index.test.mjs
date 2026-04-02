@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { __test } from "./index.mjs";
+import { AnthropicAuthPlugin } from "./index.mjs";
+const __test = AnthropicAuthPlugin.__test;
 
 test("authHeaders uses Claude Code identity", () => {
   const headers = __test.authHeaders({ authorization: "Bearer token" });

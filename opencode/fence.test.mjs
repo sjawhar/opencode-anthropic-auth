@@ -202,7 +202,8 @@ test("fence 1: API keys never undergo OAuth refresh", async () => {
 
 // ─── Fence 2: OAuth always preferred over API key ───────────────────────────
 test("fence 2: OAuth always preferred over API key when available", async () => {
-  const { __test } = await import("./index.mjs");
+  const { AnthropicAuthPlugin } = await import("./index.mjs");
+  const __test = AnthropicAuthPlugin.__test;
   const now = Date.now();
 
   // Dummy "current" that won't match any pool account by reference
@@ -240,7 +241,8 @@ test("fence 2: OAuth always preferred over API key when available", async () => 
 
 // ─── Fence 3: Cooldown ceiling from reset headers ──────────────────────────
 test("fence 3: parseCooldown result never exceeds MAX_COOLDOWN_FROM_RESET from reset headers", async () => {
-  const { __test } = await import("./index.mjs");
+  const { AnthropicAuthPlugin } = await import("./index.mjs");
+  const __test = AnthropicAuthPlugin.__test;
   const now = Date.now();
 
   const farFutureTimes = [
@@ -271,7 +273,8 @@ test("fence 3: parseCooldown result never exceeds MAX_COOLDOWN_FROM_RESET from r
 
 // ─── Fence 4: Dead accounts never selected ─────────────────────────────────
 test("fence 4: dead accounts never returned by loadPool", async () => {
-  const { __test } = await import("./index.mjs");
+  const { AnthropicAuthPlugin } = await import("./index.mjs");
+  const __test = AnthropicAuthPlugin.__test;
 
   seedAccounts(T.db, [
     { id: "active1", label: "a1", refresh: "r1", status: "active" },
@@ -349,7 +352,8 @@ test("fence 6: util timestamps updated after every successful request", async ()
 
 describe("account management fences", () => {
   test("delete last account leaves an empty pool", async () => {
-    const { __test } = await import("./index.mjs");
+    const { AnthropicAuthPlugin } = await import("./index.mjs");
+  const __test = AnthropicAuthPlugin.__test;
     const management = await import("./management.mjs");
     const db = await import("./db.mjs");
 
@@ -363,7 +367,8 @@ describe("account management fences", () => {
 
   test("delete active account keeps the remaining account usable", async () => {
     const now = Date.now();
-    const { AnthropicAuthPlugin, __test } = await import("./index.mjs");
+    const { AnthropicAuthPlugin } = await import("./index.mjs");
+    const __test = AnthropicAuthPlugin.__test;
     const management = await import("./management.mjs");
 
     seedAccounts(T.db, [
@@ -400,7 +405,8 @@ describe("account management fences", () => {
 
   test("auth-store OAuth credentials are not resurrected after the pool was initialized", async () => {
     const now = Date.now();
-    const { AnthropicAuthPlugin, __test } = await import("./index.mjs");
+    const { AnthropicAuthPlugin } = await import("./index.mjs");
+    const __test = AnthropicAuthPlugin.__test;
     const management = await import("./management.mjs");
 
     const persistedId = __test.persistAccountCredentials(
@@ -517,7 +523,7 @@ describe("account management fences", () => {
     expect(labels[0]).toBe("Claude Pro/Max");
     expect(labels[1]).toBe("Create an API Key");
     expect(labels[2]).toBe("Manually enter API Key");
-    expect(labels[3]).toBe("Manage accounts");
+    expect(labels).toHaveLength(3);
   });
 
   test("API key accounts keep their type after reset", async () => {

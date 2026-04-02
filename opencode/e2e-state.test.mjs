@@ -194,7 +194,8 @@ test("scenario 13: initial selection matches pickNext(pool, worstDummy)", async 
   };
 
   const interceptor = await getInterceptor(T, [acc1, acc2, apikey], () => authResponse(200, {}));
-  const { __test } = await import("./index.mjs");
+  const { AnthropicAuthPlugin } = await import("./index.mjs");
+  const __test = AnthropicAuthPlugin.__test;
   const pool = __test.loadPool();
   const dummy = {
     util5h: Infinity,
@@ -213,7 +214,8 @@ test("scenario 13: initial selection matches pickNext(pool, worstDummy)", async 
 
 test("scenario 14: stale overage_at clears overage flag on pool load", async () => {
   const now = Date.now();
-  const { __test } = await import("./index.mjs");
+  const { AnthropicAuthPlugin } = await import("./index.mjs");
+  const __test = AnthropicAuthPlugin.__test;
   const account = {
     id: "acc-1",
     label: "stale-overage",
@@ -269,7 +271,8 @@ test("scenario 16: auto-migration inserts OAuth credential to pool when pool is 
 
 test("scenario 3p: recovery check picks up OAuth with stale overage_at", async () => {
   const now = Date.now();
-  const { __test } = await import("./index.mjs");
+  const { AnthropicAuthPlugin } = await import("./index.mjs");
+  const __test = AnthropicAuthPlugin.__test;
   const oauth = {
     id: "o1",
     label: "oauth",

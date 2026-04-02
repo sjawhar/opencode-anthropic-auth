@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { AnthropicAuthPlugin, __test } from "./index.mjs";
+import { AnthropicAuthPlugin } from "./index.mjs";
+const __test = AnthropicAuthPlugin.__test;
 
 const { runManagementMenu } = __test;
 
@@ -8,13 +9,13 @@ const { runManagementMenu } = __test;
 // Structural tests — verify methods array shape
 // ---------------------------------------------------------------------------
 
-describe("4th auth method structure", () => {
+describe("auth method structure", () => {
   let methods;
 
-  test("plugin exposes 4 auth methods", async () => {
+  test("plugin exposes 3 auth methods (management removed from picker)", async () => {
     const plugin = await AnthropicAuthPlugin({ client: {} });
     methods = plugin.auth.methods;
-    expect(methods).toHaveLength(4);
+    expect(methods).toHaveLength(3);
   });
 
   test("first 3 methods are unchanged", async () => {
@@ -26,13 +27,9 @@ describe("4th auth method structure", () => {
     expect(methods[2]).toMatchObject({ label: "Manually enter API Key", type: "api" });
   });
 
-  test("4th method has label Manage accounts and type oauth", async () => {
+  test("only 3 auth methods (no management in auth picker)", async () => {
     const plugin = await AnthropicAuthPlugin({ client: {} });
-    const method = plugin.auth.methods[3];
-
-    expect(method.label).toBe("Manage accounts");
-    expect(method.type).toBe("oauth");
-    expect(typeof method.authorize).toBe("function");
+    expect(plugin.auth.methods).toHaveLength(3);
   });
 });
 

@@ -6,7 +6,7 @@
     "./tui": "./dist/tui.mjs"
   },
   "scripts": {
-    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:better-sqlite3 --external:bun:sqlite && esbuild tui.jsx --bundle --platform=node --format=esm --outfile=dist/tui.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:@opentui/* --external:better-sqlite3 --external:bun:sqlite --jsx=automatic",
+    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/index.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:better-sqlite3 --external:bun:sqlite && node -e \"const f=require('fs');let s=f.readFileSync('dist/index.mjs','utf8');s=s.replace(/^export \\{[^}]*__test[^}]*\\};?\\s*$/m,'export { AnthropicAuthPlugin };');f.writeFileSync('dist/index.mjs',s)\" && esbuild tui.jsx --bundle --platform=node --format=esm --outfile=dist/tui.mjs --external:@opencode-ai/* --external:@openauthjs/* --external:@opentui/* --external:better-sqlite3 --external:bun:sqlite --jsx=automatic",
     "test": "bun test index.test.mjs add-account.test.mjs cli-management.test.mjs && bun test pure.test.mjs e2e-smoke.test.mjs e2e-auth.test.mjs e2e-ratelimit.test.mjs e2e-state.test.mjs fence.test.mjs"
   },
   "files": [

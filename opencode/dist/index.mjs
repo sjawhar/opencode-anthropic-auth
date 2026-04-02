@@ -1,18 +1,16 @@
-var __defProp = Object.defineProperty;
-var __getOwnPropNames = Object.getOwnPropertyNames;
-var __esm = (fn, res) => function __init() {
-  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
-};
-var __export = (target, all) => {
-  for (var name in all)
-    __defProp(target, name, { get: all[name], enumerable: true });
-};
+// index.mjs
+import { createHash as createHash2, randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { join as join2 } from "node:path";
+import { homedir as homedir2 } from "node:os";
 
 // db.mjs
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+var DB_PATH = join(homedir(), ".opencode", "data", "anthropic-pool.db");
+var db;
 function open() {
   if (db) return db;
   const dir = join(homedir(), ".opencode", "data");
@@ -52,6 +50,7 @@ function open() {
   }
   return db;
 }
+var LOCK_TIMEOUT = 3e4;
 function tryAcquireRefreshLock(id) {
   const db2 = open();
   const now = Date.now();
@@ -73,211 +72,8 @@ function config(key, fallback) {
   const num = Number(row.value);
   return Number.isNaN(num) ? row.value : num;
 }
-function listAccounts(dbInstance) {
-  const db2 = dbInstance || open();
-  const rows = db2.prepare(`
-    SELECT
-      id, label, type, status, cooldown_until, expires,
-      util5h, util5h_at, util7d, util7d_at,
-      overage, overage_at, consecutive_failures
-    FROM account
-  `).all();
-  return rows;
-}
-function removeAccount(dbInstance, id) {
-  const db2 = dbInstance || open();
-  const result = db2.prepare("DELETE FROM account WHERE id = ?").run(id);
-  const remaining = db2.prepare("SELECT COUNT(*) as count FROM account").get();
-  return {
-    deleted: result.changes === 1,
-    remaining: remaining.count
-  };
-}
-function resetAccount(dbInstance, id) {
-  const db2 = dbInstance || open();
-  const existing = db2.prepare("SELECT id FROM account WHERE id = ?").get(id);
-  if (!existing) throw new Error(`Account not found: ${id}`);
-  db2.prepare(`
-    UPDATE account
-    SET status = 'active', cooldown_until = 0, consecutive_failures = 0, refresh_lock = 0
-    WHERE id = ?
-  `).run(id);
-  const updated = db2.prepare(`
-    SELECT
-      id, label, type, status, cooldown_until, expires,
-      util5h, util5h_at, util7d, util7d_at,
-      overage, overage_at, consecutive_failures, refresh_lock
-    FROM account WHERE id = ?
-  `).get(id);
-  return updated;
-}
-function setConfig(dbInstance, key, value) {
-  const allowlist = ["prefer_apikey_over_overage"];
-  if (!allowlist.includes(key)) {
-    throw new Error(`Unknown config key: ${key}`);
-  }
-  const db2 = dbInstance || open();
-  db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
-}
-function listConfig(dbInstance) {
-  const db2 = dbInstance || open();
-  return db2.prepare("SELECT key, value FROM config").all();
-}
-var DB_PATH, db, LOCK_TIMEOUT, STALE_5H, STALE_7D;
-var init_db = __esm({
-  "db.mjs"() {
-    DB_PATH = join(homedir(), ".opencode", "data", "anthropic-pool.db");
-    LOCK_TIMEOUT = 3e4;
-    STALE_5H = 36e5;
-    STALE_7D = 432e5;
-  }
-});
-
-// management.mjs
-var management_exports = {};
-__export(management_exports, {
-  __test: () => __test,
-  formatAccountStatus: () => formatAccountStatus,
-  formatRelativeTime: () => formatRelativeTime,
-  getConfig: () => getConfig,
-  listAccountsWithHealth: () => listAccountsWithHealth,
-  redactAccount: () => redactAccount,
-  removeAccount: () => removeAccount2,
-  resetAccount: () => resetAccount2,
-  setConfig: () => setConfig2
-});
-function formatDuration(durationMs) {
-  const totalSeconds = Math.max(0, Math.ceil(durationMs / 1e3));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes <= 0) return `${seconds}s`;
-  return `${minutes}m ${seconds}s`;
-}
-function parseConfigValue(value) {
-  if (value === "true") return true;
-  if (value === "false") return false;
-  const numeric = Number(value);
-  return Number.isNaN(numeric) ? value : numeric;
-}
-function formatRelativeTime(timestampMs) {
-  if (!timestampMs) return "never";
-  const elapsed = Math.max(0, Date.now() - timestampMs);
-  if (elapsed < 6e4) return "just now";
-  if (elapsed < 60 * 6e4) return `${Math.floor(elapsed / 6e4)}m ago`;
-  if (elapsed < 24 * 60 * 6e4) return `${Math.floor(elapsed / (60 * 6e4))}h ago`;
-  if (elapsed < 48 * 60 * 6e4) return "yesterday";
-  return `${Math.floor(elapsed / (24 * 60 * 6e4))}d ago`;
-}
-function formatAccountStatus(account) {
-  if (account.status === "dead") return "[dead]";
-  const now = Date.now();
-  if (account.cooldown_until > now) {
-    return `[cooling down: ${formatDuration(account.cooldown_until - now)}]`;
-  }
-  if (account.status === "active" && account.consecutive_failures > 0) {
-    return "[auth-failing]";
-  }
-  if (account.status === "active") return "[active]";
-  return `[${account.status ?? "unknown"}]`;
-}
-function redactAccount(account) {
-  const redacted = { ...account };
-  if (redacted.type === "apikey" && redacted.access) {
-    redacted.maskedAccess = `sk-ant-...${String(redacted.access).slice(-4)}`;
-  }
-  delete redacted.refresh;
-  delete redacted.access;
-  return redacted;
-}
-function listAccountsWithHealth(dbInstance) {
-  const now = Date.now();
-  return listAccounts(dbInstance).map((account) => {
-    const isStale5h = now - account.util5h_at > STALE_5H;
-    const isStale7d = now - account.util7d_at > STALE_7D;
-    const isCoolingDown = account.cooldown_until > now;
-    const cooldownRemaining = isCoolingDown ? account.cooldown_until - now : 0;
-    const isDead = account.status === "dead";
-    const healthObj = { ...account, isStale5h, isStale7d, isCoolingDown, cooldownRemaining, isDead };
-    const decorated = {
-      ...account,
-      isStale5h,
-      isStale7d,
-      isCoolingDown,
-      cooldownRemaining,
-      isDead,
-      util5h: isStale5h ? 0 : account.util5h,
-      util7d: isStale7d ? 0 : account.util7d,
-      statusBadge: formatAccountStatus(healthObj),
-      util5hRelative: formatRelativeTime(account.util5h_at),
-      util7dRelative: formatRelativeTime(account.util7d_at),
-      overageRelative: formatRelativeTime(account.overage_at)
-    };
-    return redactAccount(decorated);
-  });
-}
-function removeAccount2(id, dbInstance) {
-  const result = removeAccount(dbInstance, id);
-  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
-  return result;
-}
-function resetAccount2(id, dbInstance) {
-  const account = resetAccount(dbInstance, id);
-  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
-  return {
-    reset: true,
-    account: redactAccount(account)
-  };
-}
-function getConfig(dbInstance) {
-  const rawEntries = listConfig(dbInstance);
-  const userEntries = rawEntries.filter(({ key }) => !INTERNAL_KEYS.has(key));
-  let entries;
-  if (userEntries.length > 0) {
-    entries = userEntries.map(({ key, value }) => ({
-      key,
-      value: parseConfigValue(value),
-      description: CONFIG_DESCRIPTIONS[key] ?? key
-    }));
-  } else {
-    entries = Object.entries(CONFIG_DESCRIPTIONS).map(([key, description]) => ({
-      key,
-      value: false,
-      description
-    }));
-  }
-  return {
-    values: Object.fromEntries(entries.map(({ key, value }) => [key, value])),
-    entries
-  };
-}
-function setConfig2(key, value, dbInstance) {
-  setConfig(dbInstance, key, value);
-  return getConfig(dbInstance);
-}
-var CONFIG_DESCRIPTIONS, INTERNAL_KEYS, __test;
-var init_management = __esm({
-  "management.mjs"() {
-    init_db();
-    CONFIG_DESCRIPTIONS = {
-      prefer_apikey_over_overage: "Prefer API key accounts over OAuth accounts currently using overage."
-    };
-    INTERNAL_KEYS = /* @__PURE__ */ new Set(["pool_initialized"]);
-    __test = {
-      CONFIG_DESCRIPTIONS,
-      STALE_5H,
-      STALE_7D,
-      formatDuration,
-      parseConfigValue
-    };
-  }
-});
-
-// index.mjs
-init_db();
-import { createHash as createHash2, randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { join as join2 } from "node:path";
-import { homedir as homedir2 } from "node:os";
+var STALE_5H = 36e5;
+var STALE_7D = 432e5;
 
 // ../shared/oauth.mjs
 import { createHash, randomBytes } from "node:crypto";
@@ -1030,7 +826,7 @@ async function AnthropicAuthPlugin({ client: _client }) {
             `pool mode: ${pool.accounts.length} accounts, starting with "${current.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`
           );
           return {
-            apiKey: "",
+            apiKey: "opencode-oauth-dummy-key",
             async fetch(input, init) {
               poolLog(`fetch start: using "${current.label}" (${current.type})`);
               if (current.type !== "apikey" && (!current.access || current.expires < Date.now())) {
@@ -1281,35 +1077,12 @@ async function AnthropicAuthPlugin({ client: _client }) {
           provider: "anthropic",
           label: "Manually enter API Key",
           type: "api"
-        },
-        {
-          label: "Manage accounts",
-          type: "oauth",
-          authorize: async () => {
-            const { createInterface } = await import("node:readline");
-            const mgmt = await Promise.resolve().then(() => (init_management(), management_exports));
-            const db2 = open();
-            const promptFn = (question) => new Promise((resolve) => {
-              const rl = createInterface({ input: process.stdin, output: process.stdout });
-              rl.question(question, (answer) => {
-                rl.close();
-                resolve(answer.trim());
-              });
-            });
-            await runManagementMenu(db2, mgmt, promptFn);
-            return {
-              url: "",
-              instructions: "",
-              method: "auto",
-              callback: async () => ({ type: "failed" })
-            };
-          }
         }
       ]
     }
   };
 }
-var __test2 = {
+AnthropicAuthPlugin.__test = {
   authHeaders,
   buildBillingHeader,
   buildRequest,
@@ -1333,6 +1106,5 @@ var __test2 = {
   runManagementMenu
 };
 export {
-  AnthropicAuthPlugin,
-  __test2 as __test
+  AnthropicAuthPlugin
 };

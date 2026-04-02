@@ -22,7 +22,8 @@ mock.module("../shared/oauth.mjs", () => ({
   },
 }));
 
-import { __test } from "./index.mjs";
+import { AnthropicAuthPlugin } from "./index.mjs";
+const __test = AnthropicAuthPlugin.__test;
 import { createTestDb, seedAccounts } from "./test-harness.mjs";
 
 beforeEach(() => {

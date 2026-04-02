@@ -796,7 +796,7 @@ export async function AnthropicAuthPlugin({ client: _client }) {
           );
 
           return {
-            apiKey: "",
+            apiKey: "opencode-oauth-dummy-key",
             async fetch(input, init) {
               poolLog(`fetch start: using "${current.label}" (${current.type})`);
               if (current.type !== "apikey" && (!current.access || current.expires < Date.now())) {
@@ -1075,39 +1075,15 @@ export async function AnthropicAuthPlugin({ client: _client }) {
           label: "Manually enter API Key",
           type: "api",
         },
-        {
-          label: "Manage accounts",
-          type: "oauth",
-          authorize: async () => {
-            const { createInterface } = await import("node:readline");
-            const mgmt = await import("./management.mjs");
-            const db = open();
-
-            const promptFn = (question) =>
-              new Promise((resolve) => {
-                const rl = createInterface({ input: process.stdin, output: process.stdout });
-                rl.question(question, (answer) => {
-                  rl.close();
-                  resolve(answer.trim());
-                });
-              });
-
-            await runManagementMenu(db, mgmt, promptFn);
-
-            return {
-              url: "",
-              instructions: "",
-              method: "auto",
-              callback: async () => ({ type: "failed" }),
-            };
-          },
-        },
       ],
     },
   };
 }
 
-export const __test = {
+// Test internals attached as a property on the plugin function so they
+// don't appear as a separate module export (which breaks opencode's
+// legacy plugin loader — it throws on non-plugin exports).
+AnthropicAuthPlugin.__test = {
   authHeaders, buildBillingHeader, buildRequest, describeRefreshFailure,
   pickNext, isAllOAuthExhausted, persistAccountCredentials,
   createClaudeProMaxCallback, createApiKeyCallback,
