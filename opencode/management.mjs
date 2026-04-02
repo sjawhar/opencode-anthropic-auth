@@ -14,6 +14,8 @@ const CONFIG_DESCRIPTIONS = {
   prefer_apikey_over_overage: "Prefer API key accounts over OAuth accounts currently using overage.",
 };
 
+const INTERNAL_KEYS = new Set(["pool_initialized"]);
+
 function formatDuration(durationMs) {
   const totalSeconds = Math.max(0, Math.ceil(durationMs / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -108,11 +110,24 @@ export function resetAccount(id, dbInstance) {
 }
 
 export function getConfig(dbInstance) {
-  const entries = listConfig(dbInstance).map(({ key, value }) => ({
-    key,
-    value: parseConfigValue(value),
-    description: CONFIG_DESCRIPTIONS[key] ?? key,
-  }));
+  const rawEntries = listConfig(dbInstance);
+  const userEntries = rawEntries.filter(({ key }) => !INTERNAL_KEYS.has(key));
+
+  let entries;
+  if (userEntries.length > 0) {
+    entries = userEntries.map(({ key, value }) => ({
+      key,
+      value: parseConfigValue(value),
+      description: CONFIG_DESCRIPTIONS[key] ?? key,
+    }));
+  } else {
+    // Fresh install: synthesize defaults from CONFIG_DESCRIPTIONS
+    entries = Object.entries(CONFIG_DESCRIPTIONS).map(([key, description]) => ({
+      key,
+      value: false,
+      description,
+    }));
+  }
 
   return {
     values: Object.fromEntries(entries.map(({ key, value }) => [key, value])),

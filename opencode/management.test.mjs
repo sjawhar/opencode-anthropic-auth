@@ -275,4 +275,37 @@ describe("management module", () => {
 
     expect(getConfig(db).values.prefer_apikey_over_overage).toBe(false);
   });
+
+  test("getConfig returns synthesized defaults when config table has no user-facing entries", () => {
+    // Fresh install — no config rows at all
+    const result = getConfig(db);
+    expect(result.entries.length).toBeGreaterThan(0);
+    expect(result.entries[0].key).toBe("prefer_apikey_over_overage");
+    expect(result.entries[0].value).toBe(false);
+    expect(result.entries[0].description).toBe(
+      __test.CONFIG_DESCRIPTIONS.prefer_apikey_over_overage,
+    );
+    expect(result.values.prefer_apikey_over_overage).toBe(false);
+  });
+
+  test("getConfig does not expose pool_initialized internal key", () => {
+    // Insert internal key directly (bypassing setConfig which rejects it)
+    db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+
+    const result = getConfig(db);
+    const keys = result.entries.map((e) => e.key);
+    expect(keys).not.toContain("pool_initialized");
+    expect(result.values.pool_initialized).toBeUndefined();
+  });
+
+  test("getConfig returns stored user-facing config entries when present", () => {
+    db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("prefer_apikey_over_overage", "true");
+
+    const result = getConfig(db);
+    const entry = result.entries.find((e) => e.key === "prefer_apikey_over_overage");
+    expect(entry).toBeDefined();
+    expect(entry.value).toBe(true);
+  });
 });

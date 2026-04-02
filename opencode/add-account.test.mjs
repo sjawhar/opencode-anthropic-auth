@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { __test } from "./index.mjs";
+import { createTestDb, seedAccounts } from "./test-harness.mjs";
 const { persistAccountCredentials } = __test;
 
 test("persistAccountCredentials stores fresh access token and expiry from authorization exchange", () => {
@@ -12,7 +13,7 @@ test("persistAccountCredentials stores fresh access token and expiry from author
       if (sql.includes("config")) return { run() {} };
       assert.match(
         sql,
-        /INSERT OR REPLACE INTO account \(id, label, refresh, access, expires, status, consecutive_failures, type\)/,
+        /INSERT INTO account \(id, label, refresh, access, expires, status, consecutive_failures, type\).*ON CONFLICT\(id\) DO UPDATE SET/,
       );
       return {
         run(...args) {
@@ -47,7 +48,7 @@ test("persistAccountCredentials stores API key with type='apikey' and generated 
       if (sql.includes("config")) return { run() {} };
       assert.match(
         sql,
-        /INSERT OR REPLACE INTO account \(id, label, refresh, access, expires, status, consecutive_failures, type\)/,
+        /INSERT INTO account \(id, label, refresh, access, expires, status, consecutive_failures, type\).*ON CONFLICT\(id\) DO UPDATE SET/,
       );
       return {
         run(...args) {
@@ -99,4 +100,49 @@ test("pool_initialized flag prevents auto-migration resurrection", () => {
   });
 
   assert.ok(configSet, "persistAccountCredentials should set pool_initialized config flag");
+});
+
+test("persistAccountCredentials preserves utilization when re-adding existing account", () => {
+  const db = createTestDb();
+  
+  // Seed an account with utilization data
+  seedAccounts(db, [{
+    id: "acct-existing",
+    label: "Existing Account",
+    refresh: "old-refresh",
+    access: "old-access",
+    type: "oauth",
+    status: "active",
+    util5h: 0.8,
+    util5h_at: Date.now() - 1000,
+    util7d: 0.5,
+    util7d_at: Date.now() - 2000,
+    overage: 200,
+    overage_at: Date.now() - 3000,
+    cooldown_until: 9999999999,
+    consecutive_failures: 3,
+  }]);
+  
+  // Re-add same account with new credentials
+  persistAccountCredentials(db, "Existing Account", {
+    account: { uuid: "acct-existing" },
+    refresh_token: "new-refresh",
+    access_token: "new-access",
+    expires_in: 3600,
+  }, Date.now());
+  
+  // Verify utilization preserved
+  const row = db.prepare("SELECT * FROM account WHERE id = ?").get("acct-existing");
+  assert.equal(row.util5h, 0.8, "util5h should be preserved");
+  assert.equal(row.util7d, 0.5, "util7d should be preserved");
+  assert.equal(row.overage, 200, "overage should be preserved");
+  assert.equal(row.cooldown_until, 9999999999, "cooldown_until should be preserved");
+  // Credentials updated
+  assert.equal(row.refresh, "new-refresh");
+  assert.equal(row.access, "new-access");
+  // Status reset on re-add
+  assert.equal(row.status, "active");
+  assert.equal(row.consecutive_failures, 0);
+  
+  db.close(false);
 });
