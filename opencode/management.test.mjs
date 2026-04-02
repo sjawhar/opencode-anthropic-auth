@@ -90,9 +90,9 @@ describe("management helpers", () => {
     );
   });
 
-  test("formatAccountStatus returns rate-limited for failing active accounts", () => {
+  test("formatAccountStatus returns auth-failing for failing active accounts", () => {
     expect(formatAccountStatus({ status: "active", cooldown_until: 0, consecutive_failures: 1 })).toBe(
-      "[rate-limited]",
+      "[auth-failing]",
     );
   });
 

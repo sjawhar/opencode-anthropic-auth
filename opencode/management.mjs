@@ -54,7 +54,7 @@ export function formatAccountStatus(account) {
   }
 
   if (account.status === "active" && account.consecutive_failures > 0) {
-    return "[rate-limited]";
+    return "[auth-failing]";
   }
 
   if (account.status === "active") return "[active]";
