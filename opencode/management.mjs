@@ -98,11 +98,18 @@ export function listAccountsWithHealth(dbInstance) {
 }
 
 export function removeAccount(id, dbInstance) {
-  return dbRemoveAccount(dbInstance, id);
+  const result = dbRemoveAccount(dbInstance, id);
+  // Set pool_initialized to prevent auto-migration from resurrecting deleted accounts
+  try { dbInstance.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+  return result;
 }
 
 export function resetAccount(id, dbInstance) {
   const account = dbResetAccount(dbInstance, id);
+  // Set pool_initialized to prevent auto-migration from resurrecting reset accounts
+  try { dbInstance.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
   return {
     reset: true,
     account: redactAccount(account),

@@ -309,3 +309,28 @@ describe("management module", () => {
     expect(entry.value).toBe(true);
   });
 });
+
+describe("pool_initialized flag", () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+  });
+  afterEach(() => {
+    db?.close(false);
+    db = null;
+  });
+
+  test("removeAccount sets pool_initialized flag", () => {
+    seedAccounts(db, [{ id: "acc1", label: "A", refresh: "r1", status: "active" }]);
+    removeAccount("acc1", db);
+    const row = db.prepare("SELECT value FROM config WHERE key = ?").get("pool_initialized");
+    expect(row?.value).toBe("true");
+  });
+
+  test("resetAccount sets pool_initialized flag", () => {
+    seedAccounts(db, [{ id: "acc1", label: "A", refresh: "r1", status: "dead" }]);
+    resetAccount("acc1", db);
+    const row = db.prepare("SELECT value FROM config WHERE key = ?").get("pool_initialized");
+    expect(row?.value).toBe("true");
+  });
+});
