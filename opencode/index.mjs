@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { open, tryAcquireRefreshLock, releaseRefreshLock, config } from "./db.mjs";
+import { open, tryAcquireRefreshLock, releaseRefreshLock, config, STALE_5H, STALE_7D } from "./db.mjs";
 import {
   CLAUDE_CODE_AGENT,
   CLAUDE_CODE_VERSION,
@@ -28,8 +28,6 @@ function poolLog(msg) {
 // --- SQLite pool helpers ---
 
 // Staleness TTLs (ms)
-const STALE_5H = 3600000; // 1 hour
-const STALE_7D = 43200000; // 12 hours
 const STALE_OVERAGE = 1800000; // 30 min
 const TRANSIENT_THRESHOLD = 10000;
 const CLOCK_SKEW_BUFFER = 2000;
@@ -137,7 +135,6 @@ function persistAccountCredentials(db, label, credentials, now = Date.now(), typ
     type,
   );
 
-  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
   db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
 
   return id;

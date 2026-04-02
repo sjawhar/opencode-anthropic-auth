@@ -31,6 +31,7 @@ export function open() {
       cooldown_until INTEGER NOT NULL DEFAULT 0
     )
   `);
+  db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   // Migrations: add columns for refresh lock and failure tracking
   try { db.exec("ALTER TABLE account ADD COLUMN refresh_lock INTEGER NOT NULL DEFAULT 0"); } catch {}
   try { db.exec("ALTER TABLE account ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"); } catch {}
@@ -65,7 +66,6 @@ export function releaseRefreshLock(id) {
 
 export function config(key, fallback) {
   const db = open();
-  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
   const row = db.prepare("SELECT value FROM config WHERE key = ?").get(key);
   if (!row) return fallback;
   if (row.value === "true") return true;
@@ -76,8 +76,8 @@ export function config(key, fallback) {
 
 // --- Management operations ---
 
-const STALE_5H = 3600000; // 1 hour
-const STALE_7D = 43200000; // 12 hours
+export const STALE_5H = 3600000; // 1 hour
+export const STALE_7D = 43200000; // 12 hours
 
 /**
  * List all accounts (all statuses) with required fields.
@@ -183,7 +183,6 @@ export function setConfig(dbInstance, key, value) {
   }
 
   const db = dbInstance || open();
-  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
   db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
 }
 
@@ -192,6 +191,5 @@ export function setConfig(dbInstance, key, value) {
  */
 export function listConfig(dbInstance) {
   const db = dbInstance || open();
-  try { db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
   return db.prepare("SELECT key, value FROM config").all();
 }

@@ -1,10 +1,9 @@
 import { existsSync } from "node:fs";
 import { mock, test, expect, describe, beforeEach, afterEach, afterAll } from "bun:test";
+import { STALE_5H, STALE_7D } from "./db.mjs";
 
 const T = { db: null, refreshFn: null, fetchCalls: [] };
 const originalFetch = globalThis.fetch;
-const STALE_5H = 3_600_000;
-const STALE_7D = 43_200_000;
 
 function ensureConfigTable(db = T.db) {
   db?.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");

@@ -4,10 +4,10 @@ import {
   removeAccount as dbRemoveAccount,
   resetAccount as dbResetAccount,
   setConfig as dbSetConfig,
+  STALE_5H,
+  STALE_7D,
 } from "./db.mjs";
 
-const STALE_5H = 3_600_000;
-const STALE_7D = 43_200_000;
 
 const CONFIG_DESCRIPTIONS = {
   prefer_apikey_over_overage: "Prefer API key accounts over OAuth accounts currently using overage.",
@@ -62,15 +62,11 @@ export function formatAccountStatus(account) {
 
 export function redactAccount(account) {
   const redacted = { ...account };
-  const maskedAccess =
-    redacted.type === "apikey" && redacted.access
-      ? `sk-ant-...${String(redacted.access).slice(-4)}`
-      : undefined;
-
+  if (redacted.type === "apikey" && redacted.access) {
+    redacted.maskedAccess = `sk-ant-...${String(redacted.access).slice(-4)}`;
+  }
   delete redacted.refresh;
   delete redacted.access;
-
-  if (maskedAccess) redacted.maskedAccess = maskedAccess;
   return redacted;
 }
 
@@ -107,7 +103,6 @@ export function listAccountsWithHealth(dbInstance) {
 export function removeAccount(id, dbInstance) {
   const result = dbRemoveAccount(dbInstance, id);
   // Set pool_initialized to prevent auto-migration from resurrecting deleted accounts
-  try { dbInstance.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
   dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
   return result;
 }
@@ -115,7 +110,6 @@ export function removeAccount(id, dbInstance) {
 export function resetAccount(id, dbInstance) {
   const account = dbResetAccount(dbInstance, id);
   // Set pool_initialized to prevent auto-migration from resurrecting reset accounts
-  try { dbInstance.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); } catch {}
   dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
   return {
     reset: true,

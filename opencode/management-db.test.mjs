@@ -7,10 +7,10 @@ import {
   getAccountHealth,
   setConfig,
   listConfig,
+  STALE_5H,
+  STALE_7D,
 } from "./db.mjs";
 
-const STALE_5H = 3600000; // 1 hour
-const STALE_7D = 43200000; // 12 hours
 
 let db;
 
