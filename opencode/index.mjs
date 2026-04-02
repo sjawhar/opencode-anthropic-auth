@@ -127,7 +127,7 @@ function persistAccountCredentials(db, label, credentials, now = Date.now(), typ
   }
 
   db.prepare(
-    "INSERT OR REPLACE INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?)",
+    "INSERT INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?) ON CONFLICT(id) DO UPDATE SET refresh=excluded.refresh, access=excluded.access, expires=excluded.expires, status='active', consecutive_failures=0",
   ).run(
     id,
     label.trim() || "unnamed",
@@ -141,6 +141,57 @@ function persistAccountCredentials(db, label, credentials, now = Date.now(), typ
   db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
 
   return id;
+}
+
+function normalizePersistableOAuthCredentials(credentials, now = Date.now()) {
+  if (credentials.account?.uuid) return credentials;
+
+  return {
+    account: { uuid: randomUUID() },
+    refresh_token: credentials.refresh,
+    access_token: credentials.access || "",
+    expires_in: credentials.expires
+      ? Math.max(0, Math.ceil((credentials.expires - now) / 1000))
+      : 0,
+  };
+}
+
+function createClaudeProMaxCallback(verifier, deps = {}) {
+  const exchangeFn = deps.exchange ?? exchange;
+  const openDb = deps.open ?? open;
+  const persist = deps.persistAccountCredentials ?? persistAccountCredentials;
+
+  return async (code) => {
+    const credentials = await exchangeFn(code, verifier);
+    if (credentials.type !== "failed") {
+      persist(openDb(), "Claude Pro/Max", normalizePersistableOAuthCredentials(credentials));
+    }
+    return credentials;
+  };
+}
+
+function createApiKeyCallback(verifier, deps = {}) {
+  const exchangeFn = deps.exchange ?? exchange;
+  const fetchFn = deps.fetch ?? fetch;
+  const openDb = deps.open ?? open;
+  const persist = deps.persistAccountCredentials ?? persistAccountCredentials;
+  const now = deps.now ?? (() => Date.now());
+
+  return async (code) => {
+    const credentials = await exchangeFn(code, verifier);
+    if (credentials.type === "failed") return credentials;
+    const result = await fetchFn(
+      `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
+      {
+        method: "POST",
+        headers: authHeaders({
+          authorization: `Bearer ${credentials.access}`,
+        }),
+      },
+    ).then((r) => r.json());
+    persist(openDb(), "API Key", { apiKey: result.raw_key }, now(), "apikey");
+    return { type: "success", key: result.raw_key };
+  };
 }
 
 // --- Account selection ---
@@ -684,8 +735,12 @@ async function runManagementMenu(db, mgmt, promptFn) {
             console.log(`  Unknown key: ${toggle}`);
           } else {
             const newValue = typeof current === "boolean" ? !current : current;
-            mgmt.setConfig(toggle, String(newValue), db);
-            console.log(`  Set ${toggle} = ${newValue}`);
+            try {
+              mgmt.setConfig(toggle, String(newValue), db);
+              console.log(`  Set ${toggle} = ${newValue}`);
+            } catch (err) {
+              console.log(`  Error: ${err.message}`);
+            }
           }
         }
         break;
@@ -1001,7 +1056,7 @@ export async function AnthropicAuthPlugin({ client: _client }) {
               url,
               instructions: "Paste the authorization code here: ",
               method: "code",
-              callback: async (code) => exchange(code, verifier),
+              callback: createClaudeProMaxCallback(verifier),
             };
           },
         },
@@ -1014,20 +1069,7 @@ export async function AnthropicAuthPlugin({ client: _client }) {
               url,
               instructions: "Paste the authorization code here: ",
               method: "code",
-              callback: async (code) => {
-                const credentials = await exchange(code, verifier);
-                if (credentials.type === "failed") return credentials;
-                const result = await fetch(
-                  `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
-                  {
-                    method: "POST",
-                    headers: authHeaders({
-                      authorization: `Bearer ${credentials.access}`,
-                    }),
-                  },
-                ).then((r) => r.json());
-                return { type: "success", key: result.raw_key };
-              },
+              callback: createApiKeyCallback(verifier),
             };
           },
         },
@@ -1071,6 +1113,7 @@ export async function AnthropicAuthPlugin({ client: _client }) {
 export const __test = {
   authHeaders, buildBillingHeader, buildRequest, describeRefreshFailure,
   pickNext, isAllOAuthExhausted, persistAccountCredentials,
+  createClaudeProMaxCallback, createApiKeyCallback,
   loadPool, parseUtil, parseCooldown,
   STALE_5H, STALE_7D, STALE_OVERAGE, TRANSIENT_THRESHOLD,
   FALLBACK_COOLDOWN, MAX_RETRY_AFTER, MAX_COOLDOWN_FROM_RESET, DEAD_AFTER_FAILURES,
