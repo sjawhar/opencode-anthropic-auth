@@ -70,6 +70,22 @@ export function redactAccount(account) {
   return redacted;
 }
 
+export function formatAccountType(type) {
+  return type === "apikey" ? "API Key" : "OAuth";
+}
+
+export function formatUtilization(utilization) {
+  const numeric = Number(utilization ?? 0);
+  if (!Number.isFinite(numeric)) return "0%";
+  return `${Math.round(numeric * 100)}%`;
+}
+
+export function formatOverage(overage) {
+  const numeric = Number(overage ?? 0);
+  if (!Number.isFinite(numeric)) return "$0.00";
+  return `$${numeric.toFixed(2)}`;
+}
+
 export function listAccountsWithHealth(dbInstance) {
   const now = Date.now();
   return listAccounts(dbInstance).map((account) => {

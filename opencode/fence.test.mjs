@@ -523,7 +523,7 @@ describe("account management fences", () => {
     expect(labels[0]).toBe("Claude Pro/Max");
     expect(labels[1]).toBe("Create an API Key");
     expect(labels[2]).toBe("Manually enter API Key");
-    expect(labels).toHaveLength(3);
+    expect(labels[3]).toBe("Manage accounts");
   });
 
   test("API key accounts keep their type after reset", async () => {
