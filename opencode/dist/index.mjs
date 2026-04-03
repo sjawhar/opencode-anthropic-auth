@@ -35,6 +35,7 @@ function open() {
       cooldown_until INTEGER NOT NULL DEFAULT 0
     )
   `);
+  db.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   try {
     db.exec("ALTER TABLE account ADD COLUMN refresh_lock INTEGER NOT NULL DEFAULT 0");
   } catch {
@@ -64,10 +65,6 @@ function releaseRefreshLock(id) {
 }
 function config(key, fallback) {
   const db2 = open();
-  try {
-    db2.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-  } catch {
-  }
   const row = db2.prepare("SELECT value FROM config WHERE key = ?").get(key);
   if (!row) return fallback;
   if (row.value === "true") return true;
@@ -75,6 +72,8 @@ function config(key, fallback) {
   const num = Number(row.value);
   return Number.isNaN(num) ? row.value : num;
 }
+var STALE_5H = 36e5;
+var STALE_7D = 432e5;
 
 // ../shared/oauth.mjs
 import { createHash, randomBytes } from "node:crypto";
@@ -190,8 +189,6 @@ function poolLog(msg) {
   } catch {
   }
 }
-var STALE_5H = 36e5;
-var STALE_7D = 432e5;
 var STALE_OVERAGE = 18e5;
 var TRANSIENT_THRESHOLD = 1e4;
 var CLOCK_SKEW_BUFFER = 2e3;
@@ -258,6 +255,81 @@ function setCooldown(id, until) {
     until,
     id
   );
+}
+function persistAccountCredentials(db2, label, credentials, now = Date.now(), type = "oauth") {
+  let id;
+  let access;
+  let refresh;
+  let expires;
+  if (type === "apikey") {
+    id = randomUUID();
+    access = credentials.apiKey;
+    refresh = "";
+    expires = 0;
+  } else {
+    id = credentials.account?.uuid;
+    if (!id) {
+      throw new Error("Authorization succeeded but account UUID is missing.");
+    }
+    access = credentials.access_token || "";
+    refresh = credentials.refresh_token;
+    expires = credentials.expires_in ? now + credentials.expires_in * 1e3 : 0;
+  }
+  db2.prepare(
+    "INSERT INTO account (id, label, refresh, access, expires, status, consecutive_failures, type) VALUES (?, ?, ?, ?, ?, 'active', 0, ?) ON CONFLICT(id) DO UPDATE SET refresh=excluded.refresh, access=excluded.access, expires=excluded.expires, status='active', consecutive_failures=0"
+  ).run(
+    id,
+    label.trim() || "unnamed",
+    refresh,
+    access,
+    expires,
+    type
+  );
+  db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+  return id;
+}
+function normalizePersistableOAuthCredentials(credentials, now = Date.now()) {
+  if (credentials.account?.uuid) return credentials;
+  return {
+    account: { uuid: randomUUID() },
+    refresh_token: credentials.refresh,
+    access_token: credentials.access || "",
+    expires_in: credentials.expires ? Math.max(0, Math.ceil((credentials.expires - now) / 1e3)) : 0
+  };
+}
+function createClaudeProMaxCallback(verifier, deps = {}) {
+  const exchangeFn = deps.exchange ?? exchange;
+  const openDb = deps.open ?? open;
+  const persist = deps.persistAccountCredentials ?? persistAccountCredentials;
+  return async (code) => {
+    const credentials = await exchangeFn(code, verifier);
+    if (credentials.type !== "failed") {
+      persist(openDb(), "Claude Pro/Max", normalizePersistableOAuthCredentials(credentials));
+    }
+    return credentials;
+  };
+}
+function createApiKeyCallback(verifier, deps = {}) {
+  const exchangeFn = deps.exchange ?? exchange;
+  const fetchFn = deps.fetch ?? fetch;
+  const openDb = deps.open ?? open;
+  const persist = deps.persistAccountCredentials ?? persistAccountCredentials;
+  const now = deps.now ?? (() => Date.now());
+  return async (code) => {
+    const credentials = await exchangeFn(code, verifier);
+    if (credentials.type === "failed") return credentials;
+    const result = await fetchFn(
+      `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
+      {
+        method: "POST",
+        headers: authHeaders({
+          authorization: `Bearer ${credentials.access}`
+        })
+      }
+    ).then((r) => r.json());
+    persist(openDb(), "API Key", { apiKey: result.raw_key }, now(), "apikey");
+    return { type: "success", key: result.raw_key };
+  };
 }
 function pickNext(pool, current) {
   const now = Date.now();
@@ -609,6 +681,116 @@ function wrapStream(response) {
   }
   return response;
 }
+async function runManagementMenu(db2, mgmt, promptFn) {
+  let running = true;
+  while (running) {
+    const accounts = mgmt.listAccountsWithHealth(db2);
+    console.log("\n=== Anthropic Account Management ===\n");
+    if (accounts.length === 0) {
+      console.log("  No accounts configured.\n");
+    } else {
+      accounts.forEach((a, i) => {
+        console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
+      });
+      console.log();
+    }
+    console.log("  [1] List accounts");
+    console.log("  [2] Remove account");
+    console.log("  [3] Reset account");
+    console.log("  [4] Pool config");
+    console.log("  [5] Exit");
+    console.log();
+    const choice = await promptFn("Choose action [1-5]: ");
+    switch (choice) {
+      case "1": {
+        const list = mgmt.listAccountsWithHealth(db2);
+        if (list.length === 0) {
+          console.log("\n  No accounts.\n");
+        } else {
+          console.log();
+          list.forEach((a, i) => {
+            console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
+            console.log(`      5h util: ${typeof a.util5h === "number" ? a.util5h.toFixed(2) : a.util5h} (${a.util5hRelative})`);
+            console.log(`      7d util: ${typeof a.util7d === "number" ? a.util7d.toFixed(2) : a.util7d} (${a.util7dRelative})`);
+          });
+          console.log();
+        }
+        break;
+      }
+      case "2": {
+        const list = mgmt.listAccountsWithHealth(db2);
+        if (list.length === 0) {
+          console.log("\n  No accounts to remove.\n");
+          break;
+        }
+        const num = await promptFn(`Account number to remove [1-${list.length}]: `);
+        const idx = parseInt(num, 10) - 1;
+        if (idx < 0 || idx >= list.length) {
+          console.log("  Invalid selection.");
+          break;
+        }
+        const target = list[idx];
+        const confirm = await promptFn(`Remove "${target.label}"? [y/N]: `);
+        if (confirm.toLowerCase() === "y") {
+          mgmt.removeAccount(target.id, db2);
+          console.log(`  Removed "${target.label}".`);
+        } else {
+          console.log("  Cancelled.");
+        }
+        break;
+      }
+      case "3": {
+        const list = mgmt.listAccountsWithHealth(db2);
+        if (list.length === 0) {
+          console.log("\n  No accounts to reset.\n");
+          break;
+        }
+        const num = await promptFn(`Account number to reset [1-${list.length}]: `);
+        const idx = parseInt(num, 10) - 1;
+        if (idx < 0 || idx >= list.length) {
+          console.log("  Invalid selection.");
+          break;
+        }
+        const target = list[idx];
+        const result = mgmt.resetAccount(target.id, db2);
+        console.log(`  Reset "${target.label}". Status: ${result.account.status ?? "active"}`);
+        break;
+      }
+      case "4": {
+        const cfg = mgmt.getConfig(db2);
+        console.log("\n  Pool Configuration:");
+        if (cfg.entries.length === 0) {
+          console.log("  No configuration entries.\n");
+        } else {
+          cfg.entries.forEach(({ key, value, description }) => {
+            console.log(`    ${key} = ${value} \u2014 ${description}`);
+          });
+          console.log();
+        }
+        const toggle = await promptFn("Toggle a config key (or press Enter to skip): ");
+        if (toggle) {
+          const current = cfg.values[toggle];
+          if (current === void 0) {
+            console.log(`  Unknown key: ${toggle}`);
+          } else {
+            const newValue = typeof current === "boolean" ? !current : current;
+            try {
+              mgmt.setConfig(toggle, String(newValue), db2);
+              console.log(`  Set ${toggle} = ${newValue}`);
+            } catch (err) {
+              console.log(`  Error: ${err.message}`);
+            }
+          }
+        }
+        break;
+      }
+      case "5":
+      default:
+        running = false;
+        break;
+    }
+  }
+}
 async function AnthropicAuthPlugin({ client: _client }) {
   return {
     "experimental.chat.system.transform": (input, output) => {
@@ -625,7 +807,8 @@ async function AnthropicAuthPlugin({ client: _client }) {
         poolLog("loader called");
         const auth = await getAuth();
         let pool = loadPool();
-        if ((!pool || !pool.accounts.length) && auth && auth.type === "oauth" && auth.refresh) {
+        const poolInitialized = config("pool_initialized", false);
+        if ((!pool || !pool.accounts.length) && !poolInitialized && auth && auth.type === "oauth" && auth.refresh) {
           open().prepare(
             "INSERT OR IGNORE INTO account (id, label, refresh, access, expires, status, type) VALUES (?, ?, ?, ?, ?, 'active', 'oauth')"
           ).run(randomUUID(), "migrated", auth.refresh, auth.access || "", auth.expires || 0);
@@ -643,7 +826,7 @@ async function AnthropicAuthPlugin({ client: _client }) {
             `pool mode: ${pool.accounts.length} accounts, starting with "${current.label}" (5h=${current.util5h.toFixed(2)} 7d=${current.util7d.toFixed(2)} overage=${current.overage})`
           );
           return {
-            apiKey: "",
+            apiKey: "opencode-oauth-dummy-key",
             async fetch(input, init) {
               poolLog(`fetch start: using "${current.label}" (${current.type})`);
               if (current.type !== "apikey" && (!current.access || current.expires < Date.now())) {
@@ -873,7 +1056,7 @@ async function AnthropicAuthPlugin({ client: _client }) {
               url,
               instructions: "Paste the authorization code here: ",
               method: "code",
-              callback: async (code) => exchange(code, verifier)
+              callback: createClaudeProMaxCallback(verifier)
             };
           }
         },
@@ -886,20 +1069,7 @@ async function AnthropicAuthPlugin({ client: _client }) {
               url,
               instructions: "Paste the authorization code here: ",
               method: "code",
-              callback: async (code) => {
-                const credentials = await exchange(code, verifier);
-                if (credentials.type === "failed") return credentials;
-                const result = await fetch(
-                  `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
-                  {
-                    method: "POST",
-                    headers: authHeaders({
-                      authorization: `Bearer ${credentials.access}`
-                    })
-                  }
-                ).then((r) => r.json());
-                return { type: "success", key: result.raw_key };
-              }
+              callback: createApiKeyCallback(verifier)
             };
           }
         },
@@ -912,13 +1082,16 @@ async function AnthropicAuthPlugin({ client: _client }) {
     }
   };
 }
-var __test = {
+AnthropicAuthPlugin.__test = {
   authHeaders,
   buildBillingHeader,
   buildRequest,
   describeRefreshFailure,
   pickNext,
   isAllOAuthExhausted,
+  persistAccountCredentials,
+  createClaudeProMaxCallback,
+  createApiKeyCallback,
   loadPool,
   parseUtil,
   parseCooldown,
@@ -929,9 +1102,11 @@ var __test = {
   FALLBACK_COOLDOWN,
   MAX_RETRY_AFTER,
   MAX_COOLDOWN_FROM_RESET,
-  DEAD_AFTER_FAILURES
+  DEAD_AFTER_FAILURES,
+  runManagementMenu
 };
+var index_default = AnthropicAuthPlugin;
 export {
   AnthropicAuthPlugin,
-  __test
+  index_default as default
 };
