@@ -1092,3 +1092,5 @@ AnthropicAuthPlugin.__test = {
   FALLBACK_COOLDOWN, MAX_RETRY_AFTER, MAX_COOLDOWN_FROM_RESET, DEAD_AFTER_FAILURES,
   runManagementMenu,
 };
+
+export default AnthropicAuthPlugin;

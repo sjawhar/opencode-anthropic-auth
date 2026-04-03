@@ -1,6 +1,6 @@
 {
   "name": "@sjawhar/opencode-anthropic-auth",
-  "version": "0.1.1-test",
+  "version": "0.1.2",
   "exports": {
     ".": "./dist/index.mjs",
     "./tui": "./dist/tui.mjs"
@@ -22,5 +22,6 @@
   },
   "dependencies": {
     "@openauthjs/openauth": "^0.4.3"
-  }
+  },
+  "main": "./dist/index.mjs"
 }

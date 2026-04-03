@@ -1105,6 +1105,8 @@ AnthropicAuthPlugin.__test = {
   DEAD_AFTER_FAILURES,
   runManagementMenu
 };
+var index_default = AnthropicAuthPlugin;
 export {
-  AnthropicAuthPlugin
+  AnthropicAuthPlugin,
+  index_default as default
 };
