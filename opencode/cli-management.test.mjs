@@ -1,21 +1,16 @@
 import { describe, expect, test } from "bun:test";
 
 import { AnthropicAuthPlugin } from "./index.mjs";
-const __test = AnthropicAuthPlugin.__test;
-
-const { runManagementMenu } = __test;
-
-// ---------------------------------------------------------------------------
-// Structural tests — verify methods array shape
-// ---------------------------------------------------------------------------
+import { __test as menuTest } from "./cli-menu.mjs";
+import { formatAccountType, formatOverage, formatUtilization } from "./management.mjs";
 
 describe("auth method structure", () => {
   let methods;
 
-  test("plugin exposes 3 auth methods (management removed from picker)", async () => {
+  test("plugin exposes 4 auth methods", async () => {
     const plugin = await AnthropicAuthPlugin({ client: {} });
     methods = plugin.auth.methods;
-    expect(methods).toHaveLength(3);
+    expect(methods).toHaveLength(4);
   });
 
   test("first 3 methods are unchanged", async () => {
@@ -27,265 +22,97 @@ describe("auth method structure", () => {
     expect(methods[2]).toMatchObject({ label: "Manually enter API Key", type: "api" });
   });
 
-  test("only 3 auth methods (no management in auth picker)", async () => {
+  test("4th method is Manage accounts (CLI-only)", async () => {
     const plugin = await AnthropicAuthPlugin({ client: {} });
-    expect(plugin.auth.methods).toHaveLength(3);
+    const method = plugin.auth.methods[3];
+
+    expect(method.label).toBe("Manage accounts");
+    expect(method.type).toBe("oauth");
+    expect(typeof method.authorize).toBe("function");
+  });
+
+  test("manage accounts TUI path returns CLI guidance", async () => {
+    const plugin = await AnthropicAuthPlugin({ client: {} });
+    const method = plugin.auth.methods[3];
+    const result = await method.authorize();
+
+    expect(result).toMatchObject({
+      url: "",
+      instructions: "Use `opencode auth login` to manage accounts.",
+      method: "auto",
+    });
+    await expect(result.callback()).resolves.toEqual({ type: "failed" });
   });
 });
 
-// ---------------------------------------------------------------------------
-// Menu helpers
-// ---------------------------------------------------------------------------
-
-function makePrompt(responses) {
-  let i = 0;
-  return async (_question) => responses[i++] ?? "5";
-}
-
-function makeMgmt(overrides = {}) {
-  return {
-    listAccountsWithHealth: () => [],
-    removeAccount: () => true,
-    resetAccount: () => ({ reset: true, account: { status: "active" } }),
-    getConfig: () => ({ values: {}, entries: [] }),
-    setConfig: () => ({ values: {}, entries: [] }),
-    ...overrides,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// runManagementMenu — unit tests with injected dependencies
-// ---------------------------------------------------------------------------
-
-describe("runManagementMenu", () => {
-  test("exits immediately on choice 5", async () => {
-    const calls = [];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => {
-        calls.push("list");
-        return [];
-      },
-    });
-
-    await runManagementMenu(null, mgmt, makePrompt(["5"]));
-
-    // Called once for the header display
-    expect(calls).toEqual(["list"]);
+describe("cli menu helpers", () => {
+  test("formatting helpers produce user-facing labels", () => {
+    expect(formatAccountType("oauth")).toBe("OAuth");
+    expect(formatAccountType("apikey")).toBe("API Key");
+    expect(formatUtilization(0.42)).toBe("42%");
+    expect(formatOverage(0)).toBe("$0.00");
   });
 
-  test("exits on unrecognised input (default case)", async () => {
-    const mgmt = makeMgmt();
-    // anything other than 1-5 triggers the default branch which sets running = false
-    await runManagementMenu(null, mgmt, makePrompt(["banana"]));
-    // just verify it doesn't hang
+  test("buildAccountLabel includes numbering, type, and status", () => {
+    const label = menuTest.buildAccountLabel({
+      label: "Claude Pro/Max",
+      type: "oauth",
+      statusBadge: "[active]",
+      isDead: false,
+      isCoolingDown: false,
+    }, 0);
+
+    expect(label).toContain("1. Claude Pro/Max");
+    expect(label).toContain("[OAuth]");
+    expect(label).toContain("[active]");
   });
 
-  test("list accounts (choice 1) calls listAccountsWithHealth twice", async () => {
-    let callCount = 0;
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => {
-        callCount++;
-        return [];
-      },
-    });
-
-    await runManagementMenu(null, mgmt, makePrompt(["1", "5"]));
-
-    // once for header, once inside case "1", once for second loop header
-    expect(callCount).toBe(3);
+  test("buildAccountHint prefers masked API key display", () => {
+    expect(menuTest.buildAccountHint({ type: "apikey", maskedAccess: "sk-ant-...xyzw" })).toBe("sk-ant-...xyzw");
   });
 
-  test("list accounts shows details when accounts exist", async () => {
-    const accounts = [
+  test("buildAccountHint shows utilization for oauth accounts", () => {
+    expect(menuTest.buildAccountHint({ type: "oauth", util5h: 0.42, util7d: 0.15 })).toBe("5h: 42% · 7d: 15%");
+  });
+
+  test("buildMainMenuItems includes actions, accounts summary, and danger zone", () => {
+    const items = menuTest.buildMainMenuItems([
       {
-        id: "a1",
-        label: "Pro",
+        id: "acct-1",
+        label: "Claude Pro/Max",
         type: "oauth",
         statusBadge: "[active]",
         util5h: 0.42,
         util7d: 0.15,
-        util5hRelative: "2m ago",
-        util7dRelative: "1h ago",
+        isDead: false,
+        isCoolingDown: false,
+        status: "active",
       },
-    ];
-    const mgmt = makeMgmt({ listAccountsWithHealth: () => accounts });
-
-    // Should not throw
-    await runManagementMenu(null, mgmt, makePrompt(["1", "5"]));
-  });
-
-  test("remove account (choice 2) dispatches removeAccount on confirmation", async () => {
-    const removed = [];
-    const accounts = [
-      { id: "acct-1", label: "Test", type: "oauth", statusBadge: "[active]" },
-    ];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => accounts,
-      removeAccount: (id) => {
-        removed.push(id);
-        return true;
+      {
+        id: "acct-2",
+        label: "My API Key",
+        type: "apikey",
+        statusBadge: "[auth-failing]",
+        maskedAccess: "sk-ant-...xyzw",
+        isDead: false,
+        isCoolingDown: false,
+        status: "active",
       },
-    });
-
-    // "2" → remove, "1" → account #1, "y" → confirm, "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["2", "1", "y", "5"]));
-
-    expect(removed).toEqual(["acct-1"]);
-  });
-
-  test("remove account cancels on non-y confirmation", async () => {
-    const removed = [];
-    const accounts = [
-      { id: "acct-1", label: "Test", type: "oauth", statusBadge: "[active]" },
-    ];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => accounts,
-      removeAccount: (id) => {
-        removed.push(id);
-        return true;
-      },
-    });
-
-    // "2" → remove, "1" → account #1, "n" → cancel, "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["2", "1", "n", "5"]));
-
-    expect(removed).toEqual([]);
-  });
-
-  test("remove account rejects invalid selection", async () => {
-    const removed = [];
-    const accounts = [
-      { id: "acct-1", label: "Test", type: "oauth", statusBadge: "[active]" },
-    ];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => accounts,
-      removeAccount: (id) => {
-        removed.push(id);
-      },
-    });
-
-    // "2" → remove, "9" → invalid index, "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["2", "9", "5"]));
-
-    expect(removed).toEqual([]);
-  });
-
-  test("remove account handles empty account list", async () => {
-    const mgmt = makeMgmt({ listAccountsWithHealth: () => [] });
-
-    // "2" → remove, (no accounts → prints message), "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["2", "5"]));
-    // Should not throw or prompt for account number
-  });
-
-  test("reset account (choice 3) dispatches resetAccount", async () => {
-    const resets = [];
-    const accounts = [
-      { id: "acct-1", label: "Test", type: "oauth", statusBadge: "[active]" },
-    ];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => accounts,
-      resetAccount: (id) => {
-        resets.push(id);
-        return { reset: true, account: { status: "active" } };
-      },
-    });
-
-    // "3" → reset, "1" → account #1, "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["3", "1", "5"]));
-
-    expect(resets).toEqual(["acct-1"]);
-  });
-
-  test("reset account rejects invalid selection", async () => {
-    const resets = [];
-    const accounts = [
-      { id: "acct-1", label: "Test", type: "oauth", statusBadge: "[active]" },
-    ];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => accounts,
-      resetAccount: (id) => {
-        resets.push(id);
-        return { reset: true, account: {} };
-      },
-    });
-
-    // "3" → reset, "0" → invalid, "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["3", "0", "5"]));
-
-    expect(resets).toEqual([]);
-  });
-
-  test("reset account handles empty list", async () => {
-    const mgmt = makeMgmt({ listAccountsWithHealth: () => [] });
-
-    await runManagementMenu(null, mgmt, makePrompt(["3", "5"]));
-  });
-
-  test("pool config (choice 4) shows config and toggles boolean", async () => {
-    const setCalls = [];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => [],
-      getConfig: () => ({
-        values: { prefer_apikey_over_overage: false },
-        entries: [
-          {
-            key: "prefer_apikey_over_overage",
-            value: false,
-            description: "Prefer API key over overage",
-          },
-        ],
-      }),
-      setConfig: (key, value) => {
-        setCalls.push({ key, value });
-        return { values: {}, entries: [] };
-      },
-    });
-
-    // "4" → config, "prefer_apikey_over_overage" → toggle, "5" → exit
-    await runManagementMenu(
-      null,
-      mgmt,
-      makePrompt(["4", "prefer_apikey_over_overage", "5"]),
-    );
-
-    expect(setCalls).toEqual([
-      { key: "prefer_apikey_over_overage", value: "true" },
     ]);
+
+    expect(items[0]).toMatchObject({ label: "Actions", kind: "heading" });
+    expect(items[1]).toMatchObject({ label: "Add Claude Pro/Max account" });
+    expect(items[2]).toMatchObject({ label: "Add API Key" });
+    expect(items.some((item) => item.kind === "heading" && item.label === "Accounts (2 total, 1 active)")).toBe(true);
+    expect(items.some((item) => item.label?.includes("1. Claude Pro/Max"))).toBe(true);
+    expect(items.some((item) => item.label?.includes("2. My API Key"))).toBe(true);
+    expect(items.at(-2)).toMatchObject({ label: "Danger zone", kind: "heading" });
+    expect(items.at(-1)).toMatchObject({ label: "Remove all accounts", color: "red" });
   });
 
-  test("pool config skips toggle on empty input", async () => {
-    const setCalls = [];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => [],
-      getConfig: () => ({ values: {}, entries: [] }),
-      setConfig: (key, value) => {
-        setCalls.push({ key, value });
-      },
-    });
-
-    // "4" → config, "" → skip toggle, "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["4", "", "5"]));
-
-    expect(setCalls).toEqual([]);
-  });
-
-  test("pool config reports unknown key", async () => {
-    const setCalls = [];
-    const mgmt = makeMgmt({
-      listAccountsWithHealth: () => [],
-      getConfig: () => ({
-        values: { known: true },
-        entries: [{ key: "known", value: true, description: "d" }],
-      }),
-      setConfig: (key, value) => {
-        setCalls.push({ key, value });
-      },
-    });
-
-    // "4" → config, "nope" → unknown key, "5" → exit
-    await runManagementMenu(null, mgmt, makePrompt(["4", "nope", "5"]));
-
-    expect(setCalls).toEqual([]);
+  test("empty account menu disables destructive action", () => {
+    const items = menuTest.buildMainMenuItems([]);
+    expect(items.some((item) => item.label === "No accounts configured yet" && item.disabled)).toBe(true);
+    expect(items.at(-1)).toMatchObject({ label: "Remove all accounts", disabled: true });
   });
 });

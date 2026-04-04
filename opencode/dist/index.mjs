@@ -1,16 +1,18 @@
-// index.mjs
-import { createHash as createHash2, randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { join as join2 } from "node:path";
-import { homedir as homedir2 } from "node:os";
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 
 // db.mjs
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-var DB_PATH = join(homedir(), ".opencode", "data", "anthropic-pool.db");
-var db;
 function open() {
   if (db) return db;
   const dir = join(homedir(), ".opencode", "data");
@@ -50,7 +52,6 @@ function open() {
   }
   return db;
 }
-var LOCK_TIMEOUT = 3e4;
 function tryAcquireRefreshLock(id) {
   const db2 = open();
   const now = Date.now();
@@ -72,8 +73,659 @@ function config(key, fallback) {
   const num = Number(row.value);
   return Number.isNaN(num) ? row.value : num;
 }
-var STALE_5H = 36e5;
-var STALE_7D = 432e5;
+function listAccounts(dbInstance) {
+  const db2 = dbInstance || open();
+  const rows = db2.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures
+    FROM account
+  `).all();
+  return rows;
+}
+function removeAccount(dbInstance, id) {
+  const db2 = dbInstance || open();
+  const result = db2.prepare("DELETE FROM account WHERE id = ?").run(id);
+  const remaining = db2.prepare("SELECT COUNT(*) as count FROM account").get();
+  return {
+    deleted: result.changes === 1,
+    remaining: remaining.count
+  };
+}
+function resetAccount(dbInstance, id) {
+  const db2 = dbInstance || open();
+  const existing = db2.prepare("SELECT id FROM account WHERE id = ?").get(id);
+  if (!existing) throw new Error(`Account not found: ${id}`);
+  db2.prepare(`
+    UPDATE account
+    SET status = 'active', cooldown_until = 0, consecutive_failures = 0, refresh_lock = 0
+    WHERE id = ?
+  `).run(id);
+  const updated = db2.prepare(`
+    SELECT
+      id, label, type, status, cooldown_until, expires,
+      util5h, util5h_at, util7d, util7d_at,
+      overage, overage_at, consecutive_failures, refresh_lock
+    FROM account WHERE id = ?
+  `).get(id);
+  return updated;
+}
+function setConfig(dbInstance, key, value) {
+  const allowlist = ["prefer_apikey_over_overage"];
+  if (!allowlist.includes(key)) {
+    throw new Error(`Unknown config key: ${key}`);
+  }
+  const db2 = dbInstance || open();
+  db2.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run(key, value);
+}
+function listConfig(dbInstance) {
+  const db2 = dbInstance || open();
+  return db2.prepare("SELECT key, value FROM config").all();
+}
+var DB_PATH, db, LOCK_TIMEOUT, STALE_5H, STALE_7D;
+var init_db = __esm({
+  "db.mjs"() {
+    DB_PATH = join(homedir(), ".opencode", "data", "anthropic-pool.db");
+    LOCK_TIMEOUT = 3e4;
+    STALE_5H = 36e5;
+    STALE_7D = 432e5;
+  }
+});
+
+// cli-ui.mjs
+function parseKey(data) {
+  const s = data.toString();
+  if (s === "\x1B[A" || s === "\x1BOA") return "up";
+  if (s === "\x1B[B" || s === "\x1BOB") return "down";
+  if (s === "\r" || s === "\n") return "enter";
+  if (s === "") return "escape";
+  if (s === "\x1B") return "escape-start";
+  return null;
+}
+function isTTY() {
+  return Boolean(process.stdin.isTTY);
+}
+function stripAnsi(input) {
+  return input.replace(ANSI_REGEX, "");
+}
+function truncateAnsi(input, maxVisibleChars) {
+  if (maxVisibleChars <= 0) return "";
+  const visible = stripAnsi(input);
+  if (visible.length <= maxVisibleChars) return input;
+  const suffix = maxVisibleChars >= 3 ? "..." : ".".repeat(maxVisibleChars);
+  const keep = Math.max(0, maxVisibleChars - suffix.length);
+  let out = "";
+  let i = 0;
+  let kept = 0;
+  while (i < input.length && kept < keep) {
+    if (input[i] === "\x1B") {
+      const m = input.slice(i).match(ANSI_LEADING_REGEX);
+      if (m) {
+        out += m[0];
+        i += m[0].length;
+        continue;
+      }
+    }
+    out += input[i];
+    i += 1;
+    kept += 1;
+  }
+  if (out.includes("\x1B[")) {
+    return `${out}${ANSI.reset}${suffix}`;
+  }
+  return out + suffix;
+}
+function getColorCode(color) {
+  switch (color) {
+    case "red":
+      return ANSI.red;
+    case "green":
+      return ANSI.green;
+    case "yellow":
+      return ANSI.yellow;
+    case "cyan":
+      return ANSI.cyan;
+    default:
+      return "";
+  }
+}
+async function select(items, options) {
+  if (!isTTY()) {
+    throw new Error("Interactive select requires a TTY terminal");
+  }
+  if (items.length === 0) {
+    throw new Error("No menu items provided");
+  }
+  const isSelectable = (i) => !i.disabled && !i.separator && i.kind !== "heading";
+  const enabledItems = items.filter(isSelectable);
+  if (enabledItems.length === 0) {
+    throw new Error("All items disabled");
+  }
+  if (enabledItems.length === 1) {
+    return enabledItems[0].value;
+  }
+  const { message, subtitle } = options;
+  const { stdin, stdout } = process;
+  let cursor = items.findIndex(isSelectable);
+  if (cursor === -1) cursor = 0;
+  let escapeTimeout = null;
+  let isCleanedUp = false;
+  let renderedLines = 0;
+  const render = () => {
+    const columns = stdout.columns ?? 80;
+    const rows = stdout.rows ?? 24;
+    const shouldClearScreen = options.clearScreen === true;
+    const previousRenderedLines = renderedLines;
+    if (shouldClearScreen) {
+      stdout.write(ANSI.clearScreen + ANSI.moveTo(1, 1));
+    } else if (previousRenderedLines > 0) {
+      stdout.write(ANSI.up(previousRenderedLines));
+    }
+    let linesWritten = 0;
+    const writeLine = (line) => {
+      stdout.write(`${ANSI.clearLine}${line}
+`);
+      linesWritten += 1;
+    };
+    const subtitleLines = subtitle ? 3 : 0;
+    const fixedLines = 1 + subtitleLines + 2;
+    const maxVisibleItems = Math.max(1, Math.min(items.length, rows - fixedLines - 1));
+    let windowStart = 0;
+    let windowEnd = items.length;
+    if (items.length > maxVisibleItems) {
+      windowStart = cursor - Math.floor(maxVisibleItems / 2);
+      windowStart = Math.max(0, Math.min(windowStart, items.length - maxVisibleItems));
+      windowEnd = windowStart + maxVisibleItems;
+    }
+    const visibleItems = items.slice(windowStart, windowEnd);
+    const headerMessage = truncateAnsi(message, Math.max(1, columns - 4));
+    writeLine(`${ANSI.dim}\u250C  ${ANSI.reset}${headerMessage}`);
+    if (subtitle) {
+      writeLine(`${ANSI.dim}\u2502${ANSI.reset}`);
+      const sub = truncateAnsi(subtitle, Math.max(1, columns - 4));
+      writeLine(`${ANSI.cyan}\u25C6${ANSI.reset}  ${sub}`);
+      writeLine("");
+    }
+    for (let i = 0; i < visibleItems.length; i++) {
+      const itemIndex = windowStart + i;
+      const item = visibleItems[i];
+      if (!item) continue;
+      if (item.separator) {
+        writeLine(`${ANSI.dim}\u2502${ANSI.reset}`);
+        continue;
+      }
+      if (item.kind === "heading") {
+        const heading = truncateAnsi(`${ANSI.dim}${ANSI.bold}${item.label}${ANSI.reset}`, Math.max(1, columns - 6));
+        writeLine(`${ANSI.cyan}\u2502${ANSI.reset}  ${heading}`);
+        continue;
+      }
+      const isSelected = itemIndex === cursor;
+      const colorCode = getColorCode(item.color);
+      let labelText;
+      if (item.disabled) {
+        labelText = `${ANSI.dim}${item.label} (unavailable)${ANSI.reset}`;
+      } else if (isSelected) {
+        labelText = colorCode ? `${colorCode}${item.label}${ANSI.reset}` : item.label;
+        if (item.hint) labelText += ` ${ANSI.dim}${item.hint}${ANSI.reset}`;
+      } else {
+        labelText = colorCode ? `${ANSI.dim}${colorCode}${item.label}${ANSI.reset}` : `${ANSI.dim}${item.label}${ANSI.reset}`;
+        if (item.hint) labelText += ` ${ANSI.dim}${item.hint}${ANSI.reset}`;
+      }
+      labelText = truncateAnsi(labelText, Math.max(1, columns - 8));
+      if (isSelected) {
+        writeLine(`${ANSI.cyan}\u2502${ANSI.reset}  ${ANSI.green}\u25CF${ANSI.reset} ${labelText}`);
+      } else {
+        writeLine(`${ANSI.cyan}\u2502${ANSI.reset}  ${ANSI.dim}\u25CB${ANSI.reset} ${labelText}`);
+      }
+    }
+    const windowHint = items.length > visibleItems.length ? ` (${windowStart + 1}-${windowEnd}/${items.length})` : "";
+    const helpText = options.help ?? `Up/Down to select | Enter: confirm | Esc: back${windowHint}`;
+    const help = truncateAnsi(helpText, Math.max(1, columns - 6));
+    writeLine(`${ANSI.cyan}\u2502${ANSI.reset}  ${ANSI.dim}${help}${ANSI.reset}`);
+    writeLine(`${ANSI.cyan}\u2514${ANSI.reset}`);
+    if (!shouldClearScreen && previousRenderedLines > linesWritten) {
+      const extra = previousRenderedLines - linesWritten;
+      for (let i = 0; i < extra; i++) {
+        writeLine("");
+      }
+    }
+    renderedLines = linesWritten;
+  };
+  return new Promise((resolve) => {
+    const wasRaw = stdin.isRaw ?? false;
+    const cleanup = () => {
+      if (isCleanedUp) return;
+      isCleanedUp = true;
+      if (escapeTimeout) {
+        clearTimeout(escapeTimeout);
+        escapeTimeout = null;
+      }
+      try {
+        stdin.removeListener("data", onKey);
+        stdin.setRawMode(wasRaw);
+        stdin.pause();
+        stdout.write(ANSI.show);
+      } catch {
+      }
+      process.removeListener("SIGINT", onSignal);
+      process.removeListener("SIGTERM", onSignal);
+    };
+    const onSignal = () => {
+      cleanup();
+      resolve(null);
+    };
+    const finishWithValue = (value) => {
+      cleanup();
+      resolve(value);
+    };
+    const findNextSelectable = (from, direction) => {
+      if (items.length === 0) return from;
+      let next = from;
+      do {
+        next = (next + direction + items.length) % items.length;
+      } while (items[next]?.disabled || items[next]?.separator || items[next]?.kind === "heading");
+      return next;
+    };
+    const onKey = (data) => {
+      if (escapeTimeout) {
+        clearTimeout(escapeTimeout);
+        escapeTimeout = null;
+      }
+      const action = parseKey(data);
+      switch (action) {
+        case "up":
+          cursor = findNextSelectable(cursor, -1);
+          render();
+          return;
+        case "down":
+          cursor = findNextSelectable(cursor, 1);
+          render();
+          return;
+        case "enter":
+          finishWithValue(items[cursor]?.value ?? null);
+          return;
+        case "escape":
+          finishWithValue(null);
+          return;
+        case "escape-start":
+          escapeTimeout = setTimeout(() => {
+            finishWithValue(null);
+          }, ESCAPE_TIMEOUT_MS);
+          return;
+        default:
+          return;
+      }
+    };
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
+    try {
+      stdin.setRawMode(true);
+    } catch {
+      cleanup();
+      resolve(null);
+      return;
+    }
+    stdin.resume();
+    stdout.write(ANSI.hide);
+    render();
+    stdin.on("data", onKey);
+  });
+}
+async function confirm(message, defaultYes = false) {
+  const items = defaultYes ? [
+    { label: "Yes", value: true },
+    { label: "No", value: false }
+  ] : [
+    { label: "No", value: false },
+    { label: "Yes", value: true }
+  ];
+  const result = await select(items, { message });
+  return result ?? false;
+}
+var ANSI, ESCAPE_TIMEOUT_MS, ANSI_REGEX, ANSI_LEADING_REGEX;
+var init_cli_ui = __esm({
+  "cli-ui.mjs"() {
+    ANSI = {
+      // Cursor control
+      hide: "\x1B[?25l",
+      show: "\x1B[?25h",
+      up: (n = 1) => `\x1B[${n}A`,
+      down: (n = 1) => `\x1B[${n}B`,
+      clearLine: "\x1B[2K",
+      clearScreen: "\x1B[2J",
+      moveTo: (row, col) => `\x1B[${row};${col}H`,
+      // Styles
+      cyan: "\x1B[36m",
+      green: "\x1B[32m",
+      red: "\x1B[31m",
+      yellow: "\x1B[33m",
+      dim: "\x1B[2m",
+      bold: "\x1B[1m",
+      reset: "\x1B[0m",
+      inverse: "\x1B[7m"
+    };
+    ESCAPE_TIMEOUT_MS = 50;
+    ANSI_REGEX = new RegExp("\\x1b\\[[0-9;]*m", "g");
+    ANSI_LEADING_REGEX = new RegExp("^\\x1b\\[[0-9;]*m");
+  }
+});
+
+// management.mjs
+function formatDuration(durationMs) {
+  const totalSeconds = Math.max(0, Math.ceil(durationMs / 1e3));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds}s`;
+}
+function parseConfigValue(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  const numeric = Number(value);
+  return Number.isNaN(numeric) ? value : numeric;
+}
+function formatRelativeTime(timestampMs) {
+  if (!timestampMs) return "never";
+  const elapsed = Math.max(0, Date.now() - timestampMs);
+  if (elapsed < 6e4) return "just now";
+  if (elapsed < 60 * 6e4) return `${Math.floor(elapsed / 6e4)}m ago`;
+  if (elapsed < 24 * 60 * 6e4) return `${Math.floor(elapsed / (60 * 6e4))}h ago`;
+  if (elapsed < 48 * 60 * 6e4) return "yesterday";
+  return `${Math.floor(elapsed / (24 * 60 * 6e4))}d ago`;
+}
+function formatAccountStatus(account) {
+  if (account.status === "dead") return "[dead]";
+  const now = Date.now();
+  if (account.cooldown_until > now) {
+    return `[cooling down: ${formatDuration(account.cooldown_until - now)}]`;
+  }
+  if (account.status === "active" && account.consecutive_failures > 0) {
+    return "[auth-failing]";
+  }
+  if (account.status === "active") return "[active]";
+  return `[${account.status ?? "unknown"}]`;
+}
+function redactAccount(account) {
+  const redacted = { ...account };
+  if (redacted.type === "apikey" && redacted.access) {
+    redacted.maskedAccess = `sk-ant-...${String(redacted.access).slice(-4)}`;
+  }
+  delete redacted.refresh;
+  delete redacted.access;
+  return redacted;
+}
+function formatAccountType(type) {
+  return type === "apikey" ? "API Key" : "OAuth";
+}
+function formatUtilization(utilization) {
+  const numeric = Number(utilization ?? 0);
+  if (!Number.isFinite(numeric)) return "0%";
+  return `${Math.round(numeric * 100)}%`;
+}
+function formatOverage(overage) {
+  const numeric = Number(overage ?? 0);
+  if (!Number.isFinite(numeric)) return "$0.00";
+  return `$${numeric.toFixed(2)}`;
+}
+function listAccountsWithHealth(dbInstance) {
+  const now = Date.now();
+  return listAccounts(dbInstance).map((account) => {
+    const isStale5h = now - account.util5h_at > STALE_5H;
+    const isStale7d = now - account.util7d_at > STALE_7D;
+    const isCoolingDown = account.cooldown_until > now;
+    const cooldownRemaining = isCoolingDown ? account.cooldown_until - now : 0;
+    const isDead = account.status === "dead";
+    const healthObj = { ...account, isStale5h, isStale7d, isCoolingDown, cooldownRemaining, isDead };
+    const decorated = {
+      ...account,
+      isStale5h,
+      isStale7d,
+      isCoolingDown,
+      cooldownRemaining,
+      isDead,
+      util5h: isStale5h ? 0 : account.util5h,
+      util7d: isStale7d ? 0 : account.util7d,
+      statusBadge: formatAccountStatus(healthObj),
+      util5hRelative: formatRelativeTime(account.util5h_at),
+      util7dRelative: formatRelativeTime(account.util7d_at),
+      overageRelative: formatRelativeTime(account.overage_at)
+    };
+    return redactAccount(decorated);
+  });
+}
+function removeAccount2(id, dbInstance) {
+  const result = removeAccount(dbInstance, id);
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+  return result;
+}
+function resetAccount2(id, dbInstance) {
+  const account = resetAccount(dbInstance, id);
+  dbInstance.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)").run("pool_initialized", "true");
+  return {
+    reset: true,
+    account: redactAccount(account)
+  };
+}
+function getConfig(dbInstance) {
+  const rawEntries = listConfig(dbInstance);
+  const userEntries = rawEntries.filter(({ key }) => !INTERNAL_KEYS.has(key));
+  let entries;
+  if (userEntries.length > 0) {
+    entries = userEntries.map(({ key, value }) => ({
+      key,
+      value: parseConfigValue(value),
+      description: CONFIG_DESCRIPTIONS[key] ?? key
+    }));
+  } else {
+    entries = Object.entries(CONFIG_DESCRIPTIONS).map(([key, description]) => ({
+      key,
+      value: false,
+      description
+    }));
+  }
+  return {
+    values: Object.fromEntries(entries.map(({ key, value }) => [key, value])),
+    entries
+  };
+}
+function setConfig2(key, value, dbInstance) {
+  setConfig(dbInstance, key, value);
+  return getConfig(dbInstance);
+}
+var CONFIG_DESCRIPTIONS, INTERNAL_KEYS;
+var init_management = __esm({
+  "management.mjs"() {
+    init_db();
+    CONFIG_DESCRIPTIONS = {
+      prefer_apikey_over_overage: "Prefer API key accounts over OAuth accounts currently using overage."
+    };
+    INTERNAL_KEYS = /* @__PURE__ */ new Set(["pool_initialized"]);
+  }
+});
+
+// cli-menu.mjs
+var cli_menu_exports = {};
+__export(cli_menu_exports, {
+  __test: () => __test,
+  showAccountMenu: () => showAccountMenu
+});
+function colorizeStatusBadge(account) {
+  const text = account.statusBadge ?? "";
+  if (!text) return "";
+  if (account.isDead || text.includes("dead")) return `${ANSI.red}${text}${ANSI.reset}`;
+  if (account.isCoolingDown || text.includes("cooling") || text.includes("auth-failing")) {
+    return `${ANSI.yellow}${text}${ANSI.reset}`;
+  }
+  return `${ANSI.green}${text}${ANSI.reset}`;
+}
+function isActiveForSummary(account) {
+  return account.status === "active" && !account.isDead && !account.isCoolingDown && !String(account.statusBadge).includes("auth-failing");
+}
+function buildAccountLabel(account, index) {
+  const type = `[${formatAccountType(account.type)}]`;
+  const badge = colorizeStatusBadge(account);
+  return `${index + 1}. ${account.label} ${type} ${badge}`.trim();
+}
+function buildAccountHint(account) {
+  if (account.type === "apikey" && account.maskedAccess) {
+    return account.maskedAccess;
+  }
+  return `5h: ${formatUtilization(account.util5h)} \xB7 7d: ${formatUtilization(account.util7d)}`;
+}
+function buildMainMenuItems(accounts) {
+  const activeCount = accounts.filter(isActiveForSummary).length;
+  const accountItems = accounts.length > 0 ? accounts.map((account, index) => ({
+    label: buildAccountLabel(account, index),
+    hint: buildAccountHint(account),
+    value: { type: "account", accountId: account.id }
+  })) : [{ label: "No accounts configured yet", value: { type: "none" }, disabled: true }];
+  return [
+    { label: "Actions", value: { type: "noop" }, kind: "heading" },
+    { label: "Add Claude Pro/Max account", value: { type: "add-oauth" }, color: "cyan" },
+    { label: "Add API Key", value: { type: "add-apikey" }, color: "cyan" },
+    { label: "Pool config", value: { type: "pool-config" }, color: "cyan" },
+    { label: "", value: { type: "noop" }, separator: true },
+    { label: `Accounts (${accounts.length} total, ${activeCount} active)`, value: { type: "noop" }, kind: "heading" },
+    ...accountItems,
+    { label: "", value: { type: "noop" }, separator: true },
+    { label: "Danger zone", value: { type: "noop" }, kind: "heading" },
+    { label: "Remove all accounts", value: { type: "remove-all" }, color: "red", disabled: accounts.length === 0 }
+  ];
+}
+async function showPoolConfigMenu(db2) {
+  while (true) {
+    const cfg = getConfig(db2);
+    const items = [
+      ...cfg.entries.map(({ key, value, description }) => ({
+        label: `${key}: ${String(value)} \u2014 ${description}`,
+        value: { type: "toggle", key, value },
+        color: "cyan"
+      })),
+      { label: "Back", value: { type: "back" } }
+    ];
+    const result = await select(items, {
+      message: "Pool Configuration",
+      clearScreen: true,
+      help: "Up/Down to select | Enter: toggle | Esc: back"
+    });
+    if (!result || result.type === "back") return;
+    const nextValue = typeof result.value === "boolean" ? !result.value : result.value;
+    setConfig2(result.key, String(nextValue), db2);
+  }
+}
+async function showAccountDetailsMenu(db2, accountId) {
+  while (true) {
+    const account = listAccountsWithHealth(db2).find((entry) => entry.id === accountId);
+    if (!account) return;
+    const result = await select(
+      [
+        { label: "Back", value: "back" },
+        { label: "Reset account", value: "reset", color: "cyan" },
+        { label: "Remove account", value: "remove", color: "red" }
+      ],
+      {
+        message: `${account.label} [${formatAccountType(account.type)}] ${colorizeStatusBadge(account)}`,
+        subtitle: `5h util: ${formatUtilization(account.util5h)} \xB7 7d util: ${formatUtilization(account.util7d)} \xB7 Overage: ${formatOverage(account.overage)}`,
+        clearScreen: true
+      }
+    );
+    if (!result || result === "back") return;
+    if (result === "reset") {
+      resetAccount2(account.id, db2);
+      continue;
+    }
+    if (result === "remove") {
+      const approved = await confirm(`Remove ${account.label}?`);
+      if (!approved) continue;
+      removeAccount2(account.id, db2);
+      return;
+    }
+  }
+}
+async function showAccountMenu(db2, deps = {}) {
+  const { persistAccountCredentials: persistAccountCredentials2 } = deps;
+  while (true) {
+    const accounts = listAccountsWithHealth(db2);
+    const result = await select(buildMainMenuItems(accounts), {
+      message: "Anthropic Account Management",
+      subtitle: "Select an action or account",
+      clearScreen: true
+    });
+    if (!result) return null;
+    switch (result.type) {
+      case "add-oauth":
+        return "add-oauth";
+      case "add-apikey": {
+        const key = await promptApiKey();
+        if (key && persistAccountCredentials2) {
+          persistAccountCredentials2(db2, "API Key", { apiKey: key }, Date.now(), "apikey");
+          console.log(`
+  \x1B[32m\u2713\x1B[0m API key added to pool (${key.slice(0, 10)}...${key.slice(-4)})
+`);
+        } else if (key) {
+          console.log("\n  \x1B[31m\u2717\x1B[0m Invalid key or missing persistence function\n");
+        }
+        break;
+      }
+      case "pool-config":
+        await showPoolConfigMenu(db2);
+        break;
+      case "account":
+        await showAccountDetailsMenu(db2, result.accountId);
+        break;
+      case "remove-all": {
+        const approved = await confirm("Remove ALL accounts? This cannot be undone.");
+        if (!approved) break;
+        for (const account of accounts) {
+          removeAccount2(account.id, db2);
+        }
+        break;
+      }
+      default:
+        return null;
+    }
+  }
+}
+async function promptApiKey() {
+  const { createInterface } = await import("node:readline");
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question("\nPaste your Anthropic API key (sk-ant-...): ", (answer) => {
+      rl.close();
+      const key = answer.trim();
+      if (key && key.startsWith("sk-")) {
+        resolve(key);
+      } else if (key) {
+        console.log("\n  \x1B[31m\u2717\x1B[0m Invalid format. Expected sk-ant-... or sk-...\n");
+        resolve(null);
+      } else {
+        resolve(null);
+      }
+    });
+  });
+}
+var __test;
+var init_cli_menu = __esm({
+  "cli-menu.mjs"() {
+    init_cli_ui();
+    init_management();
+    __test = {
+      buildAccountHint,
+      buildAccountLabel,
+      buildMainMenuItems,
+      colorizeStatusBadge,
+      isActiveForSummary
+    };
+  }
+});
+
+// index.mjs
+init_db();
+import { createHash as createHash2, randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { join as join2 } from "node:path";
+import { homedir as homedir2 } from "node:os";
 
 // ../shared/oauth.mjs
 import { createHash, randomBytes } from "node:crypto";
@@ -333,7 +985,6 @@ function createApiKeyCallback(verifier, deps = {}) {
 }
 function pickNext(pool, current) {
   const now = Date.now();
-  const currentUtil = Math.max(current.util5h, current.util7d);
   const available = pool.accounts.filter(
     (a) => a !== current && now >= a.cooloffUntil
   );
@@ -681,116 +1332,6 @@ function wrapStream(response) {
   }
   return response;
 }
-async function runManagementMenu(db2, mgmt, promptFn) {
-  let running = true;
-  while (running) {
-    const accounts = mgmt.listAccountsWithHealth(db2);
-    console.log("\n=== Anthropic Account Management ===\n");
-    if (accounts.length === 0) {
-      console.log("  No accounts configured.\n");
-    } else {
-      accounts.forEach((a, i) => {
-        console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
-      });
-      console.log();
-    }
-    console.log("  [1] List accounts");
-    console.log("  [2] Remove account");
-    console.log("  [3] Reset account");
-    console.log("  [4] Pool config");
-    console.log("  [5] Exit");
-    console.log();
-    const choice = await promptFn("Choose action [1-5]: ");
-    switch (choice) {
-      case "1": {
-        const list = mgmt.listAccountsWithHealth(db2);
-        if (list.length === 0) {
-          console.log("\n  No accounts.\n");
-        } else {
-          console.log();
-          list.forEach((a, i) => {
-            console.log(`  [${i + 1}] ${a.label} (${a.type}) ${a.statusBadge}`);
-            console.log(`      5h util: ${typeof a.util5h === "number" ? a.util5h.toFixed(2) : a.util5h} (${a.util5hRelative})`);
-            console.log(`      7d util: ${typeof a.util7d === "number" ? a.util7d.toFixed(2) : a.util7d} (${a.util7dRelative})`);
-          });
-          console.log();
-        }
-        break;
-      }
-      case "2": {
-        const list = mgmt.listAccountsWithHealth(db2);
-        if (list.length === 0) {
-          console.log("\n  No accounts to remove.\n");
-          break;
-        }
-        const num = await promptFn(`Account number to remove [1-${list.length}]: `);
-        const idx = parseInt(num, 10) - 1;
-        if (idx < 0 || idx >= list.length) {
-          console.log("  Invalid selection.");
-          break;
-        }
-        const target = list[idx];
-        const confirm = await promptFn(`Remove "${target.label}"? [y/N]: `);
-        if (confirm.toLowerCase() === "y") {
-          mgmt.removeAccount(target.id, db2);
-          console.log(`  Removed "${target.label}".`);
-        } else {
-          console.log("  Cancelled.");
-        }
-        break;
-      }
-      case "3": {
-        const list = mgmt.listAccountsWithHealth(db2);
-        if (list.length === 0) {
-          console.log("\n  No accounts to reset.\n");
-          break;
-        }
-        const num = await promptFn(`Account number to reset [1-${list.length}]: `);
-        const idx = parseInt(num, 10) - 1;
-        if (idx < 0 || idx >= list.length) {
-          console.log("  Invalid selection.");
-          break;
-        }
-        const target = list[idx];
-        const result = mgmt.resetAccount(target.id, db2);
-        console.log(`  Reset "${target.label}". Status: ${result.account.status ?? "active"}`);
-        break;
-      }
-      case "4": {
-        const cfg = mgmt.getConfig(db2);
-        console.log("\n  Pool Configuration:");
-        if (cfg.entries.length === 0) {
-          console.log("  No configuration entries.\n");
-        } else {
-          cfg.entries.forEach(({ key, value, description }) => {
-            console.log(`    ${key} = ${value} \u2014 ${description}`);
-          });
-          console.log();
-        }
-        const toggle = await promptFn("Toggle a config key (or press Enter to skip): ");
-        if (toggle) {
-          const current = cfg.values[toggle];
-          if (current === void 0) {
-            console.log(`  Unknown key: ${toggle}`);
-          } else {
-            const newValue = typeof current === "boolean" ? !current : current;
-            try {
-              mgmt.setConfig(toggle, String(newValue), db2);
-              console.log(`  Set ${toggle} = ${newValue}`);
-            } catch (err) {
-              console.log(`  Error: ${err.message}`);
-            }
-          }
-        }
-        break;
-      }
-      case "5":
-      default:
-        running = false;
-        break;
-    }
-  }
-}
 async function AnthropicAuthPlugin({ client: _client }) {
   return {
     "experimental.chat.system.transform": (input, output) => {
@@ -1077,6 +1618,38 @@ async function AnthropicAuthPlugin({ client: _client }) {
           provider: "anthropic",
           label: "Manually enter API Key",
           type: "api"
+        },
+        {
+          label: "Manage accounts",
+          type: "oauth",
+          authorize: async (inputs) => {
+            if (!inputs) {
+              return {
+                url: "",
+                instructions: "Use `opencode auth login` to manage accounts.",
+                method: "auto",
+                callback: async () => ({ type: "failed" })
+              };
+            }
+            const { showAccountMenu: showAccountMenu2 } = await Promise.resolve().then(() => (init_cli_menu(), cli_menu_exports));
+            const db2 = open();
+            const action = await showAccountMenu2(db2, { persistAccountCredentials });
+            if (action === "add-oauth") {
+              const { url, verifier } = await authorize("max");
+              return {
+                url,
+                instructions: "Paste the authorization code here: ",
+                method: "code",
+                callback: createClaudeProMaxCallback(verifier)
+              };
+            }
+            return {
+              url: "",
+              instructions: "",
+              method: "auto",
+              callback: async () => ({ type: "failed" })
+            };
+          }
         }
       ]
     }
@@ -1102,8 +1675,7 @@ AnthropicAuthPlugin.__test = {
   FALLBACK_COOLDOWN,
   MAX_RETRY_AFTER,
   MAX_COOLDOWN_FROM_RESET,
-  DEAD_AFTER_FAILURES,
-  runManagementMenu
+  DEAD_AFTER_FAILURES
 };
 var index_default = AnthropicAuthPlugin;
 export {
